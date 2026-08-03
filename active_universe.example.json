@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "as_of": "2026-08-03T00:00:00Z",
+  "symbols": [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "XLK",
+    "XLF",
+    "XLE",
+    "TLT",
+    "GLD",
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "META",
+    "GOOGL",
+    "TSLA",
+    "JPM",
+    "V",
+    "UNH",
+    "COST",
+    "BTC/USD",
+    "ETH/USD"
+  ]
+}

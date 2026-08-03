@@ -1,0 +1,1 @@
+"""financeBot package."""

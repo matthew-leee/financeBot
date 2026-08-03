@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Model + state artifacts (regenerate via train.py)
+models/*.json
+data/*.csv
+
+# Secrets must NEVER be committed. They live in Windows env vars.
+.env
+
+# Generated runtime artifacts
+trades_log.csv
+backtest_results.csv
+
+# Operator-local live target universe (never commit; use active_universe.example.json)
+active_universe.json

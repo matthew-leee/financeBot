@@ -1,0 +1,2000 @@
+Architecture Rule
+
+  - Keep legacy APIs import-compatible until the dual engine is fully validated.
+  - Add new modules and new entrypoints first; only switch run_bot.py:1 default behavior after mocked end-to-end parity is green.
+  - No tests may hit Alpaca, SEC, FRED, BLS, EDGAR, or news providers live.
+
+  ———
+
+  # 0. Target System Topology
+
+                     ┌────────────────────────────┐
+                     │ src/data.py                │
+                     │ PIT store + feature engine │
+                     └──────────────┬─────────────┘
+                                    │
+                      interday snapshots / intraday snapshots
+                                    │
+          ┌─────────────────────────┴─────────────────────────┐
+          │                                                   │
+  ┌───────▼───────────────┐                         ┌─────────▼────────────────┐
+  │ src/strategist.py     │ daily / release trigger │ src/tactical_executor.py │
+  │ Interday Strategist   │ ─ allocation matrix ──► │ Intraday Executor        │
+  └───────┬───────────────┘                         └─────────┬────────────────┘
+          │                                                   │
+          │ target weights, hedge ratios, envelopes            │ order intents
+          │                                                   │
+          │                                         ┌─────────▼────────────────┐
+          │                                         │ src/portfolio_manager.py │
+          │                                         │ fills + FIFO reconcile   │
+          │                                         └─────────┬────────────────┘
+          │                                                   │
+          └───────────────────────┬───────────────────────────┘
+                                  │ risk metrics
+                         ┌────────▼──────────┐
+                         │ src/guardrails.py │
+                         │ Risk state machine│
+                         └───────────────────┘
+
+  ———
+
+  # 1. Non-Negotiable Legacy Compatibility
+
+  The coding agent must not remove these existing public contracts:
+
+  - config.py:1: keep MAX_POSITION_SIZE, DAILY_LOSS_LIMIT, MAX_OPEN_POSITIONS, BUY_THRESHOLD, SELL_THRESHOLD, SENTIMENT_MIN_SCORE,
+    INVERSE_SAFE_LIST, HEDGE_CORR_LOOKBACK_DAYS, EQUITY_SYMBOLS, CRYPTO_SYMBOLS.
+
+  - src/data.py:1: keep FEATURE_COLUMNS, fetch_bars(), build_features(), make_dataset().
+  - src/sentiment.py:1: keep load_sentiment(), get_score(), is_trade_allowed(), daily_returns(), select_hedge_asset().
+  - src/execution.py:1: keep run(), process_symbol(), decide_action(), _execute_buy(), _pivot_to_hedge() for legacy tests.
+  - src/fifo.py:1: keep FIFOInventory.
+  - src/trade_log.py:1: keep append_trade() and TRADE_LOG_COLUMNS.
+  - src/guardrails.py:1: keep clamp_position_size(), can_open_new_position(), record_equity_anchor(), check_circuit_breaker().
+  - src/model_io.py:1: keep ModelArtifactError, verify_model_artifacts(), load_model(), save_model(), LoadedModel.
+  - backtest.py:1: keep simulate(), merge_sentiment(), generate_historical_sentiment(), load_historical_sentiment().
+
+  Additive config.py:1 constants required by the new engine:
+
+  CORE_UNIVERSE: tuple[str, ...] = tuple(EQUITY_SYMBOLS + CRYPTO_SYMBOLS)
+  HEDGE_UNIVERSE: tuple[str, ...] = tuple(INVERSE_SAFE_LIST)
+
+  FEATURE_STORE_PATH: str = "data/feature_store"
+  MODEL_REGISTRY_DIR: str = "models/registry"
+  ALLOCATION_MATRIX_PATH: str = "models/allocation_matrix.json"
+  ORDERS_LOG_PATH: str = "orders_log.csv"
+  FILLS_LOG_PATH: str = "fills_log.csv"
+
+  ALLOCATION_STALE_SECONDS: int = 26 * 3600
+  INTRADAY_LOOKBACK_MINUTES: int = 120
+  NEWS_TAU_DAYS: float = 7.0
+
+  COVARIANCE_HALFLIFE_DAYS: int = 63
+  COVARIANCE_SHRINKAGE: float = 0.20
+  COVARIANCE_EIGEN_FLOOR: float = 1e-8
+  MIN_HEDGE_EFFECTIVENESS: float = 0.15
+  HEDGE_DECAY_PENALTY_BPS: float = 15.0
+
+  MAX_GROSS_EXPOSURE: float = 1.00
+  MAX_NET_EXPOSURE: float = 0.60
+  MAX_SYMBOL_WEIGHT: float = 0.15
+  MAX_HEDGE_WEIGHT: float = 0.25
+  VOLATILITY_TARGET_ANNUAL: float = 0.12
+
+  RISK_WARN_DRAWDOWN: float = -0.03
+  RISK_REDUCE_DRAWDOWN: float = -0.05
+  RISK_LIQUIDATE_DRAWDOWN: float = -0.08
+  RISK_KILL_DRAWDOWN: float = -0.12
+  RISK_COOLDOWN_SECONDS: int = 3600
+  MAX_RECONCILIATION_QTY_DIFF: float = 1e-3
+  MAX_SPREAD_BPS: float = 25.0
+  MAX_DATA_STALENESS_SECONDS: int = 900
+
+  ———
+
+  # Module A — src/data.py:1
+
+  ## Structural Requirements
+
+  Solves:
+
+  - Lookahead bias in macro, SEC, news, and alt-data joins.
+  - Single short-horizon OHLCV feature set.
+  - No separation between interday strategic features and intraday execution features.
+  - No time-decayed news state.
+
+  Design:
+
+  - Keep legacy fetch_bars(), build_features(), and make_dataset() unchanged.
+  - Add point-in-time records with both event_time and available_at.
+  - Every feature query must enforce available_at <= as_of.
+  - Build two feature families:
+      - interday: macro, rates, SEC filings, news embeddings, daily returns, volatility, drawdown.
+      - intraday: 1m/5m returns, VWAP distance, spread, liquidity, order-flow proxies.
+
+  SEC provides EDGAR submissions and company facts through JSON APIs on data.sec.gov; FRED exposes vintage-date endpoints for real-time/vintage
+  macro handling; BLS API v2 supports JSON time-series requests and registration-key usage for higher limits. Build connectors behind protocols and
+  mock all of them in tests. (sec.gov (https://www.sec.gov/about/developer-resources?utm_source=openai))
+
+  ## Type Stubs
+
+  from __future__ import annotations
+
+  from dataclasses import dataclass
+  from datetime import datetime, timedelta
+  from typing import Iterable, Literal, Protocol, Any
+
+  import numpy as np
+  import pandas as pd
+
+
+  AssetClass = Literal["equity", "crypto", "etf", "inverse_etf", "macro_series"]
+  FeatureHorizon = Literal["interday", "intraday"]
+
+
+  @dataclass(frozen=True)
+  class PointInTimeRecord:
+      """
+      Atomic point-in-time input record.
+
+      event_time:
+          Timestamp when the underlying economic, market, filing, or news event occurred.
+      available_at:
+          Earliest timestamp at which financeBot could have known this record.
+          All feature construction must filter with available_at <= as_of.
+      source:
+          Provider namespace: 'alpaca', 'fred', 'bls', 'sec', 'news', 'altdata'.
+      entity_id:
+          Symbol, CIK, macro series id, industry id, or normalized entity key.
+      field:
+          Field name such as 'close', 'cpi_yoy', '10y_yield', 'filing_text_hash'.
+      value:
+          JSON-serializable scalar, text pointer, or vector reference.
+      revision_id:
+          Vintage/revision id when the provider revises history.
+      confidence:
+          Parser/source confidence in [0.0, 1.0].
+      """
+      event_time: datetime
+      available_at: datetime
+      source: str
+      entity_id: str
+      field: str
+      value: Any
+      revision_id: str | None = None
+      confidence: float = 1.0
+
+
+  @dataclass(frozen=True)
+  class NewsEvent:
+      """
+      Entity-linked news, filing, or alt-data text event.
+
+      embedding:
+          Dense vector generated out-of-band.
+      source_weight:
+          Reliability multiplier for the source.
+      event_weight:
+          Severity, novelty, or materiality multiplier.
+      """
+      event_id: str
+      event_time: datetime
+      available_at: datetime
+      source: str
+      text_hash: str
+      tickers: tuple[str, ...]
+      themes: tuple[str, ...]
+      embedding: np.ndarray
+      source_weight: float
+      event_weight: float
+
+
+  @dataclass(frozen=True)
+  class FeatureSnapshot:
+      """
+      Immutable model input matrix generated as of one decision timestamp.
+
+      frame:
+          Index is symbol/entity id. Columns are numeric model features.
+      as_of:
+          Decision timestamp used for point-in-time filtering.
+      horizon:
+          'interday' for strategic allocation, 'intraday' for execution timing.
+      lineage:
+          Provider/version/hash metadata for reproducibility.
+      """
+      frame: pd.DataFrame
+      as_of: datetime
+      horizon: FeatureHorizon
+      lineage: dict[str, str]
+
+
+  class DataConnector(Protocol):
+      """Provider boundary for external data. Implementations must be mockable."""
+
+      def fetch_raw(
+          self,
+          *,
+          symbols: Iterable[str],
+          start: datetime,
+          end: datetime,
+      ) -> list[PointInTimeRecord]:
+          """
+          Fetch raw provider records.
+
+          Must:
+          - populate event_time and available_at,
+          - preserve vintage/revision metadata when available,
+          - avoid live network calls in tests,
+          - avoid transforming revised data into final-value history.
+          """
+          ...
+
+  ## Feature Store Interface
+
+  class PointInTimeFeatureStore:
+      """
+      Local point-in-time feature store.
+
+      This class is the anti-lookahead boundary. No model, strategist, executor,
+      validator, or backtester may read external data directly once this exists.
+      """
+
+      def __init__(self, storage_path: str) -> None:
+          """
+          Initialize storage.
+
+          Expected layout:
+              storage_path/bronze/raw_records.parquet
+              storage_path/silver/normalized_records.parquet
+              storage_path/gold/feature_snapshots/
+          """
+
+      def upsert_records(self, records: Iterable[PointInTimeRecord]) -> int:
+          """
+          Insert or update records.
+
+          Deduplicate key:
+              (source, entity_id, field, event_time, revision_id)
+
+          Pseudocode:
+              normalize timestamps to UTC
+              validate confidence in [0, 1]
+              reject records with available_at < event_time only if impossible for source
+              merge into silver table by dedupe key
+              return number of accepted records
+          """
+
+      def query_asof(
+          self,
+          *,
+          entity_ids: Iterable[str],
+          fields: Iterable[str] | None,
+          as_of: datetime,
+          lookback: timedelta | None = None,
+      ) -> pd.DataFrame:
+          """
+          Return latest eligible observations as of `as_of`.
+
+          Pseudocode:
+              records = load silver records
+              records = records[available_at <= as_of]
+              records = records[entity_id in entity_ids]
+              if fields is not None:
+                  records = records[field in fields]
+              if lookback is not None:
+                  records = records[event_time >= as_of - lookback]
+
+              sort by entity_id, field, event_time, available_at
+              for each entity_id/field:
+                  keep latest eligible row
+              pivot to entity_id index and field columns
+              create missing indicators for absent fields
+              return numeric-coerced frame
+          """
+
+      def build_interday_snapshot(
+          self,
+          *,
+          universe: Iterable[str],
+          as_of: datetime,
+          news_tau: timedelta,
+      ) -> FeatureSnapshot:
+          """
+          Build daily strategic features.
+
+          Include:
+          - 20/63/126/252-day returns.
+          - 20/63/126-day realized volatility.
+          - 252-day drawdown.
+          - yield-curve level/slope/curvature.
+          - vintage-safe inflation/labor/rates deltas.
+          - SEC filing age and embedding deltas.
+          - news embedding direction and intensity.
+
+          Pseudocode:
+              prices = query_asof(price fields, lookback=400 trading days)
+              macro = query_asof(macro fields, lookback=3 years)
+              filings = query_asof(sec fields, lookback=18 months)
+              news_events = load NewsEvent where available_at <= as_of
+
+              for symbol in universe:
+                  close = point-in-time daily closes up to as_of
+                  ret_20 = close[-1] / close[-21] - 1
+                  ret_63 = close[-1] / close[-64] - 1
+                  ret_126 = close[-1] / close[-127] - 1
+                  ret_252 = close[-1] / close[-253] - 1
+
+                  daily_returns = close.pct_change().dropna()
+                  vol_20 = std(daily_returns[-20:]) * sqrt(252)
+                  vol_63 = std(daily_returns[-63:]) * sqrt(252)
+                  drawdown_252 = close[-1] / max(close[-252:]) - 1
+
+                  curve_10y_2y = y10 - y2
+                  curve_10y_3m = y10 - y3m
+                  curve_curvature = 2 * y5 - y2 - y10
+
+                  news_direction, news_intensity = build_news_embedding_state(...)
+
+              concatenate numeric features
+              add missing indicator columns
+              never backfill from future
+              return FeatureSnapshot(...)
+          """
+
+      def build_intraday_snapshot(
+          self,
+          *,
+          symbols: Iterable[str],
+          as_of: datetime,
+          lookback_minutes: int,
+      ) -> FeatureSnapshot:
+          """
+          Build intraday tactical features.
+
+          Include:
+          - 1m and 5m returns.
+          - realized volatility over 30m/60m.
+          - VWAP distance.
+          - spread in bps.
+          - volume percentile versus same time-of-day baseline.
+          - order-flow imbalance if available.
+
+          Pseudocode:
+              bars = query eligible intraday bars where available_at <= as_of
+              quotes = query latest spread/liquidity records
+              for symbol:
+                  ret_1m = close[-1] / close[-2] - 1
+                  ret_5m = close[-1] / close[-6] - 1
+                  vwap_distance = close[-1] / vwap_session - 1
+                  spread_bps = (ask - bid) / midpoint * 10000
+                  realized_vol_30m = std(1m returns[-30:]) * sqrt(390)
+              return FeatureSnapshot(...)
+          """
+
+  ## News Embedding Math
+
+  def build_news_embedding_state(
+      events: Iterable[NewsEvent],
+      *,
+      symbol: str,
+      as_of: datetime,
+      tau: timedelta,
+      embedding_dim: int,
+  ) -> tuple[np.ndarray, float]:
+      """
+      Build time-decayed news state without lookahead.
+
+      Formula:
+          raw_state_t = Σ_s exp(-(t - available_at_s) / τ)
+                        * source_weight_s
+                        * event_weight_s
+                        * embedding_s
+
+          mass_t = Σ_s |exp(-(t - available_at_s) / τ)
+                       * source_weight_s
+                       * event_weight_s|
+
+          direction_t = raw_state_t / ||raw_state_t||_2, if norm > 0
+          intensity_t = log1p(mass_t)
+
+      Include event s only if:
+          symbol ∈ event.tickers
+          event.available_at <= as_of
+
+      Return:
+          (direction vector, intensity scalar)
+      """
+
+  ———
+
+  # Module B — src/validation.py:1
+
+  ## Structural Requirements
+
+  Solves:
+
+  - Cross-asset leakage caused by concatenating symbol datasets and splitting by row index.
+  - Label-overlap leakage for multi-day forward targets.
+  - Classifier-only metrics that ignore portfolio utility, turnover, and cost.
+  - Lack of group-wise temporal folds.
+
+  ## Required Panel Schema
+
+  Every training row must include:
+
+  timestamp: timezone-aware decision timestamp
+  symbol: normalized tradable symbol
+  label_end_time: timestamp touched by the forward label
+  feature columns: numeric
+  target column: continuous forward excess return or ranking target
+
+  ## Type Stubs
+
+  from __future__ import annotations
+
+  from dataclasses import dataclass
+  from datetime import datetime, timedelta
+  from typing import Callable, Protocol
+
+  import pandas as pd
+
+
+  @dataclass(frozen=True)
+  class TemporalFold:
+      """
+      Leakage-safe temporal walk-forward fold.
+
+      train_idx/test_idx refer to row labels in the sorted panel.
+      train rows must satisfy:
+          timestamp < test_start - embargo
+          label_end_time < test_start
+      """
+      fold_id: int
+      train_start: datetime
+      train_end: datetime
+      test_start: datetime
+      test_end: datetime
+      train_idx: pd.Index
+      test_idx: pd.Index
+
+
+  @dataclass(frozen=True)
+  class ValidationMetrics:
+      """Strategy-aware validation metrics for one fold."""
+      fold_id: int
+      n_train: int
+      n_test: int
+      rank_ic: float
+      hit_rate: float
+      mean_return: float
+      turnover: float
+      max_drawdown: float
+      net_sharpe: float
+      cost_adjusted_pnl: float
+
+
+  @dataclass(frozen=True)
+  class PanelWalkForwardReport:
+      """Full validation report."""
+      metrics_by_fold: list[ValidationMetrics]
+      aggregate: dict[str, float]
+      leakage_checks: dict[str, bool]
+
+
+  class PredictiveModel(Protocol):
+      """Minimal model interface for validation."""
+
+      def fit(self, x: pd.DataFrame, y: pd.Series) -> object:
+          """Fit model on training matrix."""
+          ...
+
+      def predict(self, x: pd.DataFrame) -> pd.Series:
+          """Return continuous score or expected return."""
+          ...
+
+  ## Fold Builder
+
+  def make_temporal_group_folds(
+      panel: pd.DataFrame,
+      *,
+      timestamp_col: str,
+      symbol_col: str,
+      label_end_col: str,
+      n_splits: int,
+      min_train_period: timedelta,
+      test_period: timedelta,
+      embargo: timedelta,
+  ) -> list[TemporalFold]:
+      """
+      Build calendar-time walk-forward folds across all symbols.
+
+      Pseudocode:
+          assert required columns exist
+          convert timestamp_col and label_end_col to timezone-aware UTC
+          sorted_panel = panel.sort_values([timestamp_col, symbol_col])
+
+          first_time = min(sorted_panel[timestamp_col])
+          last_time = max(sorted_panel[timestamp_col])
+          first_test_start = first_time + min_train_period
+
+          for fold_id in range(n_splits):
+              test_start = first_test_start + fold_id * test_period
+              test_end = test_start + test_period
+              train_end = test_start - embargo
+
+              train_mask =
+                  sorted_panel[timestamp_col] < train_end
+                  AND sorted_panel[label_end_col] < test_start
+
+              test_mask =
+                  sorted_panel[timestamp_col] >= test_start
+                  AND sorted_panel[timestamp_col] < test_end
+
+              reject fold if train/test empty
+
+              assert max(train.timestamp) < min(test.timestamp)
+              assert max(train.label_end_time) < min(test.timestamp)
+
+              append TemporalFold(...)
+
+      Requirement:
+          embargo >= max(label_horizons) for overlapping forward labels.
+      """
+
+  ## Validation Runner
+
+  def walk_forward_validate_panel(
+      *,
+      panel: pd.DataFrame,
+      feature_cols: list[str],
+      target_col: str,
+      timestamp_col: str,
+      symbol_col: str,
+      label_end_col: str,
+      model_factory: Callable[[], PredictiveModel],
+      n_splits: int,
+      min_train_period: timedelta,
+      test_period: timedelta,
+      embargo: timedelta,
+      transaction_cost_bps: float,
+  ) -> PanelWalkForwardReport:
+      """
+      Run leakage-safe panel validation.
+
+      Pseudocode:
+          panel = panel.sort_values([timestamp_col, symbol_col])
+          folds = make_temporal_group_folds(...)
+
+          for fold:
+              train = panel.loc[fold.train_idx]
+              test = panel.loc[fold.test_idx]
+
+              model = model_factory()
+              model.fit(train[feature_cols], train[target_col])
+
+              test_scores = model.predict(test[feature_cols])
+
+              for each timestamp in test:
+                  rank symbols by score
+                  long top quantile
+                  optionally underweight/avoid bottom quantile
+                  compute paper weights w_t
+
+                  gross_return_t = Σ_i w_{t-1,i} * realized_return_{t,i}
+                  turnover_t = Σ_i |w_{t,i} - w_{t-1,i}|
+                  cost_t = turnover_t * transaction_cost_bps / 10000
+                  net_return_t = gross_return_t - cost_t
+
+              rank_ic = mean Spearman(score, realized forward return) by timestamp
+              hit_rate = mean(sign(score) == sign(target))
+              net_sharpe = mean(net_returns) / std(net_returns) * sqrt(periods_per_year)
+              max_drawdown = min(cumulative_net - cumulative_net.cummax)
+              cost_adjusted_pnl = sum(net_returns)
+
+          aggregate mean/std/worst fold metrics
+          leakage_checks:
+              no_train_after_test_start
+              no_label_overlap
+              all_symbols_split_by_time
+              deterministic_after_shuffle
+      """
+
+  ## Label Builder
+
+  def build_forward_return_labels(
+      prices: pd.DataFrame,
+      *,
+      symbol_col: str = "symbol",
+      timestamp_col: str = "timestamp",
+      price_col: str = "close",
+      horizons: tuple[int, ...] = (5, 20, 63),
+      benchmark_symbol: str | None = None,
+  ) -> pd.DataFrame:
+      """
+      Build multi-horizon forward labels.
+
+      For symbol i at time t and horizon h:
+          r_i,t,h = close_i,t+h / close_i,t - 1
+
+      If benchmark is available:
+          excess_i,t,h = r_i,t,h - r_benchmark,t,h
+
+      Required output columns:
+          timestamp
+          symbol
+          label_end_time_h
+          fwd_return_h
+          fwd_excess_h
+
+      Pseudocode:
+          sort by symbol, timestamp
+          for each symbol group:
+              future_price = close.shift(-h)
+              label_end_time = timestamp.shift(-h)
+              fwd_return = future_price / close - 1
+          drop rows where future_price missing
+          never use label rows in live features
+      """
+
+  ———
+
+  # Module C — src/strategist.py:1 NEW
+
+  ## Structural Requirements
+
+  Solves:
+
+  - No portfolio-level allocation layer.
+  - No macro/news/SEC integration.
+  - Active Pivot based on noisy 30-day Pearson correlation.
+  - No hedge lifecycle or hedge effectiveness check.
+  - No volatility/covariance-aware position construction.
+
+  The strategist emits a daily target allocation matrix. The intraday executor may trade only inside this envelope.
+
+  ## Type Stubs
+
+  from __future__ import annotations
+
+  from dataclasses import dataclass, field
+  from datetime import datetime
+  from typing import Literal, Protocol
+
+  import numpy as np
+  import pandas as pd
+
+
+  DirectionBias = Literal["long", "short", "flat", "hedge"]
+
+
+  @dataclass(frozen=True)
+  class StrategistConfig:
+      """Configuration for daily structural allocation."""
+      core_universe: tuple[str, ...]
+      hedge_universe: tuple[str, ...]
+      max_gross_exposure: float
+      max_net_exposure: float
+      max_symbol_weight: float
+      max_hedge_weight: float
+      volatility_target: float
+      covariance_halflife_days: int
+      covariance_shrinkage: float
+      covariance_eigen_floor: float
+      risk_aversion: float
+      turnover_penalty_bps: float
+      hedge_decay_penalty_bps: float
+      min_hedge_effectiveness: float
+
+
+  @dataclass(frozen=True)
+  class TargetAllocation:
+      """
+      One target allocation row.
+
+      target_weight:
+          Desired instrument weight as fraction of equity.
+      min_weight/max_weight:
+          Intraday executor envelope.
+      hedge_for:
+          Core asset hedged by this instrument, if pair hedge.
+      hedge_ratio:
+          Covariance-derived hedge ratio, if applicable.
+      """
+      symbol: str
+      target_weight: float
+      min_weight: float
+      max_weight: float
+      direction_bias: DirectionBias
+      volatility_ceiling: float
+      rebalance_priority: float
+      hedge_for: str | None = None
+      hedge_ratio: float | None = None
+      expected_return: float | None = None
+      expected_volatility: float | None = None
+
+
+  @dataclass(frozen=True)
+  class AllocationMatrix:
+      """Daily structural target allocation."""
+      as_of: datetime
+      rows: dict[str, TargetAllocation]
+      covariance_version: str
+      feature_snapshot_id: str
+      regime: str
+      diagnostics: dict[str, float | str] = field(default_factory=dict)
+
+      def symbols(self) -> set[str]:
+          """Return symbols explicitly controlled by this matrix."""
+          return set(self.rows)
+
+      def get(self, symbol: str) -> TargetAllocation | None:
+          """Return allocation row for symbol, if present."""
+          return self.rows.get(symbol)
+
+
+  class FeatureStoreLike(Protocol):
+      def build_interday_snapshot(self, *, universe, as_of, news_tau): ...
+
+
+  class ModelRegistryLike(Protocol):
+      def predict(self, role: str, features: pd.DataFrame) -> pd.Series: ...
+
+  ## Strategist Interface
+
+  class InterdayStrategist:
+      """
+      Daily portfolio construction layer.
+
+      Responsibilities:
+      - Build point-in-time interday features.
+      - Estimate expected returns.
+      - Classify macro regime.
+      - Estimate covariance.
+      - Construct core allocation.
+      - Add covariance-based hedge overlay.
+      - Emit target allocation matrix with active hedge lifecycle.
+      """
+
+      def __init__(
+          self,
+          *,
+          config: StrategistConfig,
+          feature_store: FeatureStoreLike,
+          model_registry: ModelRegistryLike,
+      ) -> None:
+          """Wire dependencies. No broker access belongs in this class."""
+
+      def generate_allocation(self, *, as_of: datetime) -> AllocationMatrix:
+          """
+          Generate daily target allocation.
+
+          Pseudocode:
+              universe = core_universe ∪ hedge_universe
+              snapshot = feature_store.build_interday_snapshot(
+                  universe=universe,
+                  as_of=as_of,
+                  news_tau=timedelta(days=config.news_tau_days)
+              )
+
+              mu = predict_expected_returns(snapshot.frame)
+              regime = predict_regime(snapshot.frame)
+
+              returns = load_point_in_time_return_panel(universe, as_of)
+              covariance = estimate_covariance(
+                  returns,
+                  halflife_days=config.covariance_halflife_days,
+                  shrinkage=config.covariance_shrinkage
+              )
+
+              core_weights = optimize_core_portfolio(
+                  expected_returns=mu.loc[core_universe],
+                  covariance=covariance.loc[core_universe, core_universe],
+                  previous_weights=load_previous_weights()
+              )
+
+              hedge_weights = compute_portfolio_hedge_overlay(
+                  core_weights=core_weights,
+                  covariance=covariance
+              )
+
+              combined = core_weights.add(hedge_weights, fill_value=0.0)
+              combined = enforce_portfolio_constraints(combined, covariance, regime)
+
+              rows = build_target_rows(combined, mu, covariance, regime)
+
+              Important:
+                  include zero-weight rows for previously active hedges that are
+                  no longer needed, so the executor can exit them.
+
+              return AllocationMatrix(...)
+          """
+
+  ## Expected Return Logic
+
+      def predict_expected_returns(self, features: pd.DataFrame) -> pd.Series:
+          """
+          Predict horizon-consistent expected return per symbol.
+
+          Mathematical form:
+              μ_i =
+                  model_return_i
+                  + β_macro_i · macro_state_t
+                  + β_news_i · news_state_i,t
+                  + β_filing_i · filing_state_i,t
+                  - liquidity_penalty_i
+                  - stale_data_penalty_i
+
+          Pseudocode:
+              raw = model_registry.predict("expected_return", features)
+              clip extreme values to robust percentile bounds
+              subtract liquidity/staleness penalties
+              return Series indexed by symbol
+          """
+
+      def predict_regime(self, features: pd.DataFrame) -> str:
+          """
+          Predict regime label.
+
+          Allowed examples:
+              risk_on
+              inflation_shock
+              growth_slowdown
+              liquidity_stress
+              crisis
+
+          Regime affects:
+              gross exposure cap
+              volatility target
+              hedge aggressiveness
+              turnover penalty
+          """
+
+  ## Covariance Estimation
+
+      def estimate_covariance(
+          self,
+          returns: pd.DataFrame,
+          *,
+          halflife_days: int,
+          shrinkage: float,
+      ) -> pd.DataFrame:
+          """
+          Estimate PSD covariance matrix.
+
+          EWMA:
+              Σ_ewma = E_λ[(r_t - μ)(r_t - μ)^T]
+
+          Shrinkage:
+              Σ_shrunk = (1 - α)Σ_ewma + α diag(Σ_ewma)
+
+          PSD floor:
+              Σ = Q diag(max(eigenvalue, eigen_floor)) Qᵀ
+
+          Pseudocode:
+              returns = returns.sort_index().dropna(how="all")
+              ewma_cov = exponentially weighted covariance using halflife_days
+              diag_cov = diagonal matrix from ewma_cov
+              sigma = (1 - shrinkage) * ewma_cov + shrinkage * diag_cov
+              sigma = (sigma + sigma.T) / 2
+
+              eigenvalues, eigenvectors = eigh(sigma)
+              eigenvalues = clip(eigenvalues, eigen_floor, inf)
+              sigma_psd = eigenvectors @ diag(eigenvalues) @ eigenvectors.T
+
+              return DataFrame(sigma_psd, index=symbols, columns=symbols)
+          """
+
+  ## Hedge Math
+
+      def compute_pair_hedge_ratio(
+          self,
+          *,
+          target_symbol: str,
+          hedge_symbol: str,
+          covariance: pd.DataFrame,
+      ) -> float:
+          """
+          Compute pair hedge ratio.
+
+          Formula:
+              h* = - Cov(r_target, r_hedge) / Var(r_hedge)
+
+          If the target has weight w_target:
+              hedge_weight = w_target * h*
+
+          For a long inverse ETF:
+              Cov(target, inverse) < 0
+              therefore h* > 0
+              so a positive long inverse-ETF weight offsets target beta.
+
+          Guardrails:
+              if Var(hedge) <= epsilon: return 0.0
+              clip hedge_weight later by max_hedge_weight
+          """
+
+      def compute_portfolio_hedge_overlay(
+          self,
+          *,
+          core_weights: pd.Series,
+          covariance: pd.DataFrame,
+      ) -> pd.Series:
+          """
+          Compute multi-instrument minimum-variance hedge overlay.
+
+          Partition symbols:
+              C = core symbols
+              H = hedge symbols
+
+          Minimum-variance overlay:
+              h_raw = - Σ_HH⁻¹ Σ_HC w_C
+
+          Decay/carry sparsity penalty:
+              h_j = sign(h_raw_j) * max(
+                  0,
+                  |h_raw_j| - λ_decay * decay_cost_j / (2 * Σ_HH,jj)
+              )
+
+          Hedge effectiveness:
+              pre_var = w_Cᵀ Σ_CC w_C
+              variance_reduction = w_Cᵀ Σ_CH Σ_HH⁻¹ Σ_HC w_C
+              effectiveness = variance_reduction / pre_var
+
+          Accept hedge only if:
+              effectiveness >= min_hedge_effectiveness
+
+          Pseudocode:
+              core = nonzero core_weights
+              hedges = hedge_universe
+
+              sigma_hh = covariance.loc[hedges, hedges]
+              sigma_hc = covariance.loc[hedges, core]
+              sigma_hh_inv = pinv(psd_floor(sigma_hh))
+
+              h_raw = - sigma_hh_inv @ sigma_hc @ core_weights[core]
+
+              apply soft-threshold decay penalty
+              clip each hedge to ±max_hedge_weight
+              compute effectiveness
+
+              if pre_var <= epsilon or effectiveness < threshold:
+                  return zeros indexed by hedge_universe
+
+              return hedge weights
+          """
+
+  ## Core Portfolio Optimization
+
+      def optimize_core_portfolio(
+          self,
+          *,
+          expected_returns: pd.Series,
+          covariance: pd.DataFrame,
+          previous_weights: pd.Series | None,
+      ) -> pd.Series:
+          """
+          Build constrained core allocation.
+
+          Objective:
+              maximize_w:
+                  μᵀw
+                  - (risk_aversion / 2) * wᵀΣw
+                  - turnover_penalty * ||w - w_prev||₁
+
+          Constraints:
+              Σ_i |w_i| <= max_gross_exposure
+              |Σ_i w_i| <= max_net_exposure
+              |w_i| <= max_symbol_weight
+              sqrt(wᵀΣw) <= volatility_target
+              core shorts disabled unless explicitly enabled
+
+          Initial deterministic implementation:
+              volatility_i = sqrt(Σ_ii)
+              score_i = μ_i / max(volatility_i, epsilon)
+              keep only score_i > 0
+              raw_weight_i = score_i / volatility_i
+              normalize raw weights
+              scale to volatility target
+              apply symbol caps
+              rescale to gross/net caps
+              apply turnover smoothing versus previous_weights
+          """
+
+  ———
+
+  # Module D — src/tactical_executor.py:1 NEW
+
+  ## Structural Requirements
+
+  Solves:
+
+  - Orphaned hedge exit bug.
+  - Single-symbol loop that ignores hedge inventory.
+  - Market orders generated from stale bars without allocation envelopes.
+  - No separation between strategic allocation and intraday timing.
+
+  Processing universe must always be:
+
+  core_universe
+  ∪ hedge_universe
+  ∪ allocation_matrix.symbols()
+  ∪ broker_current_positions
+  ∪ internal_fifo_positions
+
+  ## Type Stubs
+
+  from __future__ import annotations
+
+  from dataclasses import dataclass
+  from datetime import datetime, timedelta
+  from typing import Literal
+
+  import pandas as pd
+
+
+  TacticalAction = Literal["buy", "sell", "hold"]
+  OrderStyle = Literal["market", "limit", "notional"]
+
+
+  @dataclass(frozen=True)
+  class TacticalSignal:
+      """Intraday execution timing signal."""
+      symbol: str
+      action: TacticalAction
+      urgency: float
+      confidence: float
+      limit_price: float | None
+      reason: str
+
+
+  @dataclass(frozen=True)
+  class OrderIntent:
+      """
+      Pre-broker order request.
+
+      quantity:
+          Positive absolute quantity.
+      reduce_only:
+          If True, order must not increase absolute exposure.
+      target_weight_after:
+          Expected instrument weight after fill.
+      """
+      symbol: str
+      side: Literal["buy", "sell"]
+      quantity: float
+      order_style: OrderStyle
+      limit_price: float | None
+      reduce_only: bool
+      target_weight_after: float
+      reason: str
+
+  ## Executor Interface
+
+  class TacticalExecutor:
+      """
+      Continuous intraday executor.
+
+      Consumes AllocationMatrix and moves actual positions toward target envelopes.
+      It is not allowed to override strategist-level risk envelopes.
+      """
+
+      def __init__(
+          self,
+          *,
+          strategist: object,
+          portfolio_manager: object,
+          feature_store: object,
+          risk_machine: object,
+          broker: object,
+          loop_interval_seconds: float,
+          allocation_refresh_interval: timedelta,
+      ) -> None:
+          """Initialize dependencies."""
+
+      def run_forever(self) -> None:
+          """
+          Main loop.
+
+          Pseudocode:
+              while True:
+                  now = utcnow()
+
+                  portfolio_manager.poll_and_apply_fills()
+                  reconciliation = portfolio_manager.reconcile_with_broker()
+                  snapshot = portfolio_manager.snapshot()
+
+                  metrics = build_risk_metrics(snapshot, reconciliation)
+                  risk_decision = risk_machine.evaluate(metrics)
+
+                  if risk_decision.kill_process:
+                      broker.cancel_all_open_orders()
+                      persist final state
+                      raise SystemExit(1)
+
+                  allocation = refresh_allocation_if_due(now=now)
+                  symbols = build_processing_universe(allocation)
+
+                  for symbol in symbols:
+                      try:
+                          process_symbol(
+                              symbol=symbol,
+                              allocation=allocation,
+                              risk_decision=risk_decision,
+                              now=now,
+                          )
+                      except Exception as exc:
+                          log symbol-level error
+                          continue
+
+                  sleep(loop_interval_seconds)
+          """
+
+      def refresh_allocation_if_due(self, *, now: datetime) -> object:
+          """
+          Refresh daily allocation.
+
+          Refresh when:
+              - no matrix exists,
+              - matrix age > allocation_refresh_interval,
+              - macro/filing/news release trigger occurs,
+              - risk state requires de-risk recompute.
+          """
+
+      def build_processing_universe(self, allocation: object) -> set[str]:
+          """
+          Build complete execution universe.
+
+          Pseudocode:
+              symbols = set(config.CORE_UNIVERSE)
+              symbols |= set(config.HEDGE_UNIVERSE)
+              symbols |= allocation.symbols()
+              symbols |= portfolio_manager.current_position_symbols()
+              symbols |= portfolio_manager.internal_fifo_symbols()
+              return symbols
+
+          This prevents orphaned hedges.
+          """
+
+      def process_symbol(
+          self,
+          *,
+          symbol: str,
+          allocation: object,
+          risk_decision: object,
+          now: datetime,
+      ) -> OrderIntent | None:
+          """
+          Process one symbol toward allocation target.
+
+          Pseudocode:
+              target = allocation.get(symbol)
+
+              if target is None:
+                  target_weight = 0
+                  min_weight = 0
+                  max_weight = 0
+              else:
+                  target_weight = target.target_weight
+                  min_weight = target.min_weight
+                  max_weight = target.max_weight
+
+              snapshot = portfolio_manager.snapshot()
+              current_weight = snapshot.weight(symbol)
+
+              intraday = feature_store.build_intraday_snapshot(
+                  symbols=[symbol],
+                  as_of=now,
+                  lookback_minutes=config.INTRADAY_LOOKBACK_MINUTES,
+              )
+
+              signal = compute_tactical_signal(
+                  symbol=symbol,
+                  intraday_features=intraday.frame.loc[symbol],
+              )
+
+              desired_delta_weight = target_weight - current_weight
+
+              if current_weight < min_weight or current_weight > max_weight:
+                  urgency = 1.0
+              else:
+                  urgency = signal.urgency
+
+              allowed_delta = apply_risk_state_rules(
+                  desired_delta_weight=desired_delta_weight,
+                  current_weight=current_weight,
+                  target_weight=target_weight,
+                  risk_decision=risk_decision,
+              )
+
+              allowed_delta *= urgency * signal.confidence
+
+              if abs(allowed_delta) < minimum_trade_weight:
+                  return None
+
+              intent = convert_weight_delta_to_order_intent(
+                  symbol=symbol,
+                  delta_weight=allowed_delta,
+                  snapshot=snapshot,
+                  latest_price=intraday.frame.loc[symbol, "last_price"],
+                  signal=signal,
+              )
+
+              if intent is None:
+                  return None
+
+              if not risk_machine.is_order_allowed(...):
+                  return None
+
+              portfolio_manager.submit_order_intent(intent)
+              return intent
+          """
+
+  ## Tactical Signal Logic
+
+  def compute_tactical_signal(
+      *,
+      symbol: str,
+      intraday_features: pd.Series,
+  ) -> TacticalSignal:
+      """
+      Convert intraday features into execution timing.
+
+      Pseudocode:
+          spread_bps = intraday_features["spread_bps"]
+          realized_vol = intraday_features["realized_vol_30m"]
+          vwap_distance = intraday_features["vwap_distance"]
+          order_flow = intraday_features.get("order_flow_imbalance", 0)
+          volume_pct = intraday_features.get("volume_percentile", 0.5)
+
+          if spread_bps > config.MAX_SPREAD_BPS:
+              return hold urgency=0 confidence=1 reason="spread too wide"
+
+          buy_score =
+              -0.25 * vwap_distance
+              +0.20 * order_flow
+              +0.15 * volume_pct
+              -0.10 * zscore(spread_bps)
+
+          sell_score =
+               0.25 * vwap_distance
+              -0.20 * order_flow
+              +0.15 * volume_pct
+              -0.10 * zscore(spread_bps)
+
+          if buy_score > threshold:
+              return buy urgency=sigmoid(buy_score) confidence=bounded_confidence
+          if sell_score > threshold:
+              return sell urgency=sigmoid(sell_score) confidence=bounded_confidence
+          return hold urgency=0
+      """
+
+  ## Weight-to-Order Conversion
+
+  def convert_weight_delta_to_order_intent(
+      *,
+      symbol: str,
+      delta_weight: float,
+      snapshot: object,
+      latest_price: float,
+      signal: TacticalSignal,
+  ) -> OrderIntent | None:
+      """
+      Convert desired weight change into hard-capped order intent.
+
+      Mandatory safety rule:
+          Re-apply config.MAX_POSITION_SIZE here. Strategist weights are model logic;
+          model logic may never override the hard per-order notional cap.
+
+      Math:
+          desired_notional = abs(delta_weight) * snapshot.equity
+          capped_notional = min(desired_notional, config.MAX_POSITION_SIZE)
+          quantity = floor(capped_notional / latest_price, 6)
+
+      Pseudocode:
+          if latest_price <= 0: return None
+          side = "buy" if delta_weight > 0 else "sell"
+          quantity = clamp_position_size(capped_notional, latest_price)
+
+          if quantity <= 0:
+              return None
+
+          target_weight_after = snapshot.weight(symbol) + sign(delta_weight) * capped_notional / snapshot.equity
+
+          reduce_only = abs(target_weight_after) < abs(snapshot.weight(symbol))
+
+          return OrderIntent(...)
+      """
+
+  ———
+
+  # Module E — src/portfolio_manager.py:1 NEW
+
+  ## Structural Requirements
+
+  Solves:
+
+  - FIFO based on requested size instead of actual fill.
+  - Trade log using stale bar close instead of execution price.
+  - No partial-fill handling.
+  - No broker/internal reconciliation.
+  - No slippage or fee accounting.
+  - No idempotency protection.
+
+  This module becomes the only live writer of orders, fills, and inventory state.
+
+  ## Type Stubs
+
+  from __future__ import annotations
+
+  from dataclasses import dataclass
+  from datetime import datetime
+  from typing import Literal
+
+  import pandas as pd
+
+
+  @dataclass(frozen=True)
+  class BrokerFill:
+      """Actual broker execution event."""
+      fill_id: str
+      order_id: str
+      symbol: str
+      side: Literal["buy", "sell"]
+      filled_qty: float
+      filled_price: float
+      filled_at: datetime
+      fees: float
+      liquidity_flag: str | None = None
+
+
+  @dataclass(frozen=True)
+  class BrokerPosition:
+      """Broker-reported position."""
+      symbol: str
+      quantity: float
+      market_value: float
+      avg_entry_price: float
+      unrealized_pnl: float
+
+
+  @dataclass(frozen=True)
+  class PortfolioSnapshot:
+      """Reconciled portfolio state."""
+      as_of: datetime
+      equity: float
+      cash: float
+      positions: dict[str, BrokerPosition]
+      internal_weights: dict[str, float]
+      gross_exposure: float
+      net_exposure: float
+      realized_pnl: float
+      unrealized_pnl: float
+
+      def weight(self, symbol: str) -> float:
+          """Return market_value / equity for symbol, or 0 if flat."""
+
+
+  @dataclass(frozen=True)
+  class ReconciliationDiff:
+      """Difference between broker truth and internal FIFO state."""
+      symbol: str
+      broker_qty: float
+      internal_qty: float
+      qty_diff: float
+      broker_avg_price: float | None
+      internal_avg_price: float | None
+      severity: Literal["none", "minor", "major"]
+
+  ## Manager Interface
+
+  class PortfolioManager:
+      """
+      Owns order lifecycle, fill processing, FIFO inventory, and reconciliation.
+
+      Live PnL and FIFO lots must be derived from BrokerFill events, never from
+      requested order size or stale bar price.
+      """
+
+      def __init__(
+          self,
+          *,
+          broker: object,
+          fifo_inventory: object,
+          state_path: str,
+          orders_log_path: str,
+          fills_log_path: str,
+      ) -> None:
+          """Initialize manager state and processed fill id cache."""
+
+      def submit_order_intent(self, intent: object) -> str | None:
+          """
+          Submit order intent to broker.
+
+          Pseudocode:
+              validate quantity > 0
+              if intent.reduce_only:
+                  verify current broker position exists and exposure will decline
+
+              create client_order_id
+              send order via broker
+              persist orders_log row:
+                  submitted_at
+                  client_order_id
+                  broker_order_id
+                  symbol
+                  side
+                  requested_qty
+                  order_type
+                  limit_price
+                  reduce_only
+                  reason
+                  status
+
+              return broker_order_id or None
+          """
+
+      def poll_and_apply_fills(self) -> list[BrokerFill]:
+          """
+          Poll broker for new fills and apply exactly once.
+
+          Pseudocode:
+              raw_fills = broker.list_recent_fills()
+              applied = []
+
+              for raw in raw_fills:
+                  fill = normalize_broker_fill(raw)
+
+                  if fill.fill_id in processed_fill_ids:
+                      continue
+
+                  apply_fill(fill)
+                  processed_fill_ids.add(fill.fill_id)
+                  applied.append(fill)
+
+              persist processed_fill_ids
+              return applied
+          """
+
+      def apply_fill(self, fill: BrokerFill) -> float:
+          """
+          Apply actual fill to FIFO and write fill log.
+
+          BUY:
+              fifo.add_buy(fill.symbol, fill.filled_qty, fill.filled_price)
+              realized_pnl = -fill.fees
+
+          SELL:
+              gross_fifo_pnl = fifo.add_sell(fill.symbol, fill.filled_qty, fill.filled_price)
+              realized_pnl = gross_fifo_pnl - fill.fees
+
+          Slippage:
+              arrival_price = lookup order reference price
+              if side == buy:
+                  slippage = fill.filled_price - arrival_price
+              else:
+                  slippage = arrival_price - fill.filled_price
+              slippage_bps = slippage / arrival_price * 10000
+
+          Persist fills_log row:
+              filled_at
+              fill_id
+              order_id
+              symbol
+              side
+              actual_qty
+              actual_price
+              fees
+              realized_pnl
+              arrival_price
+              slippage_bps
+              liquidity_flag
+
+          Return realized_pnl.
+          """
+
+      def reconcile_with_broker(self) -> list[ReconciliationDiff]:
+          """
+          Compare broker positions to internal FIFO positions.
+
+          Pseudocode:
+              broker_positions = broker.get_all_positions()
+              internal_positions = fifo.positions()
+
+              all_symbols = union(broker symbols, internal symbols)
+
+              for symbol:
+                  broker_qty = broker quantity or 0
+                  internal_qty = fifo open_qty or 0
+                  qty_diff = broker_qty - internal_qty
+
+                  if abs(qty_diff) <= dust_threshold:
+                      severity = "none"
+                  elif abs(qty_diff) <= minor_threshold:
+                      severity = "minor"
+                  else:
+                      severity = "major"
+
+              if any major:
+                  emit alert
+                  risk machine must transition at least to FREEZE_NEW_ENTRIES
+
+              never fabricate FIFO lots silently
+              return diffs
+          """
+
+      def snapshot(self) -> PortfolioSnapshot:
+          """
+          Return broker-truth portfolio snapshot.
+
+          Rules:
+              - equity and market values come from broker.
+              - FIFO provides realized PnL and cost basis.
+              - missing broker while positions exist is a risk event.
+          """
+
+      def current_position_symbols(self) -> set[str]:
+          """Return symbols with nonzero broker positions."""
+
+      def internal_fifo_symbols(self) -> set[str]:
+          """Return symbols with nonzero FIFO inventory."""
+
+  ## New Log Schemas
+
+  orders_log.csv:
+      submitted_at, client_order_id, broker_order_id, symbol, side,
+      requested_qty, order_type, limit_price, reduce_only, reason, status
+
+  fills_log.csv:
+      filled_at, fill_id, broker_order_id, symbol, side,
+      actual_qty, actual_price, fees, realized_pnl,
+      arrival_price, slippage_bps, liquidity_flag
+
+  Keep src/trade_log.py:1 as a legacy shim for existing tests and dashboard migration.
+
+  ———
+
+  # Module F — src/guardrails.py:1
+
+  ## Structural Requirements
+
+  Solves:
+
+  - Blunt sys.exit() behavior.
+  - No intermediate risk states.
+  - No action-level permissions.
+  - No integration of reconciliation, data freshness, model health, and exposure metrics.
+
+  Keep legacy check_circuit_breaker() as an adapter that still calls sys.exit(1) when the original 24h DAILY_LOSS_LIMIT is breached.
+
+  ## Type Stubs
+
+  from __future__ import annotations
+
+  from dataclasses import dataclass
+  from datetime import datetime, timedelta
+  from enum import Enum
+  from typing import Literal
+
+
+  class RiskState(str, Enum):
+      """Risk state controlling permitted trading behavior."""
+      NORMAL = "NORMAL"
+      FREEZE_NEW_ENTRIES = "FREEZE_NEW_ENTRIES"
+      REDUCE_RISK = "REDUCE_RISK"
+      LIQUIDATE_ONLY = "LIQUIDATE_ONLY"
+      KILL_PROCESS = "KILL_PROCESS"
+
+
+  @dataclass(frozen=True)
+  class RiskLimits:
+      """Hard and soft portfolio risk limits."""
+      max_symbol_weight: float
+      max_gross_exposure: float
+      max_net_exposure: float
+      warn_drawdown: float
+      reduce_drawdown: float
+      liquidate_drawdown: float
+      kill_drawdown: float
+      max_spread_bps: float
+      max_data_staleness_seconds: int
+      max_reconciliation_qty_diff: float
+      cooldown: timedelta
+
+
+  @dataclass(frozen=True)
+  class RiskMetrics:
+      """Current risk telemetry."""
+      as_of: datetime
+      equity: float
+      high_watermark_equity: float
+      rolling_24h_pnl: float
+      drawdown: float
+      gross_exposure: float
+      net_exposure: float
+      largest_symbol_weight: float
+      data_staleness_seconds: int
+      major_reconciliation_breaks: int
+      open_order_count: int
+      api_error_rate: float
+      model_artifacts_valid: bool
+      broker_available: bool
+
+
+  @dataclass(frozen=True)
+  class RiskDecision:
+      """Risk-state output consumed by tactical executor."""
+      state: RiskState
+      previous_state: RiskState
+      reason: str
+      allow_new_entries: bool
+      allow_increase_exposure: bool
+      allow_reduce_exposure: bool
+      force_liquidation: bool
+      kill_process: bool
+
+  ## State Machine
+
+  class RiskStateMachine:
+      """
+      Multi-tier risk guardrail engine.
+
+      State severity:
+          NORMAL < FREEZE_NEW_ENTRIES < REDUCE_RISK < LIQUIDATE_ONLY < KILL_PROCESS
+      """
+
+      def __init__(self, *, limits: RiskLimits, state_path: str) -> None:
+          """Load persisted risk state, high-watermark, and cooldown metadata."""
+
+      def evaluate(self, metrics: RiskMetrics) -> RiskDecision:
+          """
+          Evaluate state transitions.
+
+          KILL_PROCESS if any:
+              drawdown <= kill_drawdown
+              model_artifacts_valid is False during live trading
+              broker_available is False while positions are open
+              repeated liquidation failure
+              runaway open orders detected
+
+          LIQUIDATE_ONLY if any:
+              drawdown <= liquidate_drawdown
+              major_reconciliation_breaks > 0 and cannot resolve
+              data_staleness_seconds > max_data_staleness_seconds * 3
+              api_error_rate critically high while positions are open
+
+          REDUCE_RISK if any:
+              drawdown <= reduce_drawdown
+              gross_exposure > max_gross_exposure
+              abs(net_exposure) > max_net_exposure
+              largest_symbol_weight > max_symbol_weight
+              hedge overlay missing while portfolio beta excessive
+
+          FREEZE_NEW_ENTRIES if any:
+              drawdown <= warn_drawdown
+              stale data but not critical
+              minor reconciliation mismatch
+              spread/liquidity degraded
+              macro release lockout active
+
+          NORMAL only if:
+              no higher-state trigger active
+              cooldown elapsed
+              reconciliation clean
+              data fresh
+              exposures within limits
+
+          Recovery:
+              move down at most one severity level per evaluation after cooldown.
+              never jump directly from LIQUIDATE_ONLY to NORMAL.
+          """
+
+      def permissions_for_state(self, state: RiskState) -> RiskDecision:
+          """
+          Permission matrix.
+
+          NORMAL:
+              allow new entries, increases, reductions.
+
+          FREEZE_NEW_ENTRIES:
+              block new entries and exposure increases.
+              allow reductions/exits.
+
+          REDUCE_RISK:
+              block new entries and increases.
+              allow only orders reducing absolute exposure.
+
+          LIQUIDATE_ONLY:
+              force target weights to zero.
+              allow reduce-to-flat only.
+
+          KILL_PROCESS:
+              cancel open orders if possible.
+              no new orders.
+              terminate process.
+          """
+
+      def is_order_allowed(
+          self,
+          *,
+          state: RiskState,
+          current_weight: float,
+          target_weight_after: float,
+          side: Literal["buy", "sell"],
+          reduce_only: bool,
+      ) -> bool:
+          """
+          Validate one order against current state.
+
+          Pseudocode:
+              if state == KILL_PROCESS:
+                  return False
+
+              exposure_before = abs(current_weight)
+              exposure_after = abs(target_weight_after)
+              increases = exposure_after > exposure_before + epsilon
+
+              if state == NORMAL:
+                  return True
+
+              if state == FREEZE_NEW_ENTRIES:
+                  return not increases
+
+              if state == REDUCE_RISK:
+                  return exposure_after < exposure_before
+
+              if state == LIQUIDATE_ONLY:
+                  return exposure_after < exposure_before and moves toward zero
+
+              return False
+          """
+
+  ## Legacy Adapter
+
+  def check_circuit_breaker(current_equity: float) -> None:
+      """
+      Legacy-compatible circuit breaker.
+
+      Required behavior:
+          If rolling 24h PnL <= config.DAILY_LOSS_LIMIT, call sys.exit(1).
+
+      New behavior:
+          Internally may also build RiskMetrics and call RiskStateMachine, but it
+          must preserve existing tests that assert SystemExit on a daily loss breach.
+      """
+
+  ———
+
+  # Cross-Cutting Additions
+
+  ## src/model_io.py:1 Additive Model Registry
+
+  from dataclasses import dataclass
+  from typing import Literal, Protocol
+
+  import pandas as pd
+
+
+  ModelRole = Literal[
+      "legacy_direction",
+      "expected_return",
+      "regime",
+      "covariance",
+      "tactical",
+  ]
+
+
+  class InferenceModel(Protocol):
+      def predict(self, x: pd.DataFrame) -> pd.Series:
+          """Return model output indexed like x."""
+          ...
+
+
+  @dataclass(frozen=True)
+  class ModelArtifact:
+      """Role-keyed trained artifact metadata."""
+      role: ModelRole
+      model_path: str
+      feature_columns: tuple[str, ...]
+      horizon: Literal["interday", "intraday"]
+      validation: dict
+      trained_at: str
+
+
+  class ModelRegistry:
+      """
+      Multi-model loader.
+
+      Must preserve legacy `load_model()` and `verify_model_artifacts()`.
+      """
+
+      def __init__(self, registry_dir: str) -> None:
+          """Load registry metadata."""
+
+      def verify(self, required_roles: tuple[ModelRole, ...]) -> None:
+          """Raise ModelArtifactError if any role artifact is missing or invalid."""
+
+      def load(self, role: ModelRole) -> InferenceModel:
+          """Load role model and enforce feature-column order."""
+
+      def predict(self, role: ModelRole, features: pd.DataFrame) -> pd.Series:
+          """Order features per artifact metadata, then call model."""
+
+  ## backtest.py:1 Dual-Horizon Replay Additive Function
+
+  def replay_dual_horizon(
+      *,
+      price_panel: pd.DataFrame,
+      feature_store: object,
+      strategist: object,
+      tactical_executor: object,
+      portfolio_manager: object,
+      slippage_model: object,
+  ) -> pd.DataFrame:
+      """
+      Event-driven backtest mirroring live dual-horizon flow.
+
+      Pseudocode:
+          for each trading day:
+              allocation = strategist.generate_allocation(as_of=day_open)
+
+              for each intraday bar:
+                  portfolio_manager.poll_and_apply_fills()
+                  portfolio_manager.reconcile_with_broker()
+
+                  symbols = tactical_executor.build_processing_universe(allocation)
+
+                  for symbol in symbols:
+                      intent = tactical_executor.process_symbol(...)
+                      if intent:
+                          fill = simulate_fill(intent, bar, slippage_model)
+                          portfolio_manager.apply_fill(fill)
+
+          return fills_log DataFrame
+
+      Requirement:
+          This is the validation path for Active Pivot replacement, hedge exits,
+          fills, fees, and slippage. Legacy `simulate()` remains for old tests.
+      """
+
+  ———
+
+  # Implementation Strategy
+
+  ## Phase 0 — Freeze Legacy Baseline
+
+  - Run python -m pytest -q.
+  - Add tests/test_legacy_contract.py asserting every legacy import listed above still exists.
+  - Do not change live default loop yet.
+  - Add fixtures:
+      - shuffled multi-symbol panel for validation leakage.
+      - orphaned hedge position.
+      - partial broker fill.
+      - duplicate fill id.
+      - major broker/FIFO mismatch.
+
+  - Gate: full existing suite green.
+
+  ## Phase 1 — Add Config + Model Registry
+
+  - Add new constants to config.py:1; do not rename old constants.
+  - Add ModelRegistry to src/model_io.py:1; keep LoadedModel untouched.
+  - Tests:
+      - legacy model artifact tests still pass.
+      - registry rejects missing required role.
+      - registry enforces feature column order.
+
+  - Gate: python -m pytest tests/test_config.py tests/test_model_guard.py -q.
+
+  ## Phase 2 — Add Point-in-Time Data Layer
+
+  - Extend src/data.py:1 with:
+      - PointInTimeRecord
+      - NewsEvent
+      - FeatureSnapshot
+      - DataConnector
+      - PointInTimeFeatureStore
+      - build_news_embedding_state()
+
+  - Keep legacy functions untouched.
+  - Tests:
+      - available_at > as_of excluded.
+      - macro revision uses correct vintage.
+      - news decay formula correct.
+      - news direction and intensity emitted.
+      - missing values create missing indicators, no future backfill.
+
+  - Gate: existing data tests + new PIT tests green.
+
+  ## Phase 3 — Replace Validation Internals Additively
+
+  - Add:
+      - TemporalFold
+      - ValidationMetrics
+      - PanelWalkForwardReport
+      - make_temporal_group_folds()
+      - walk_forward_validate_panel()
+      - build_forward_return_labels()
+
+  - Keep existing walk_forward_validate() for legacy training until migration.
+  - Tests:
+      - shuffled panel produces deterministic folds.
+      - no train timestamp after test start.
+      - no label_end_time overlap.
+      - all symbols split by time, not by row order.
+      - embargo must cover max label horizon.
+
+  - Gate: validation tests green.
+
+  ## Phase 4 — Add Strategist
+
+  - Create src/strategist.py:1.
+  - Implement allocation dataclasses and InterdayStrategist.
+  - Implement:
+      - EWMA covariance.
+      - shrinkage.
+      - PSD eigen floor.
+      - pair hedge ratio.
+      - portfolio hedge overlay.
+      - hedge effectiveness check.
+      - zero-weight rows for stale active hedges.
+
+  - Tests:
+      - negative covariance with inverse ETF produces positive hedge weight.
+      - zero hedge variance returns zero hedge.
+      - singular covariance uses pseudo-inverse safely.
+      - low hedge effectiveness chooses cash/no hedge.
+      - previously held hedge appears with target zero when no longer needed.
+
+  - Gate: strategist tests green.
+
+  ## Phase 5 — Add Portfolio Manager, Risk Machine, Tactical Executor
+
+  - Create src/portfolio_manager.py:1.
+  - Create src/tactical_executor.py:1.
+  - Extend src/guardrails.py:1 with state machine while preserving legacy circuit breaker.
+  - Add fill-based logs; keep old trade log.
+  - Add run_bot.py:1 flag:
+      - --engine legacy
+      - --engine dual
+      - default remains legacy until Phase 5 passes.
+
+  - Tests:
+      - partial fills create correct FIFO lots.
+      - duplicate fills ignored by fill_id.
+      - sell fills realize FIFO PnL net of fees.
+      - stale bar price never used as fill price.
+      - major reconciliation mismatch escalates risk.
+      - orphaned hedge is included in processing universe and exits to target zero.
+      - FREEZE_NEW_ENTRIES blocks increases.
+      - REDUCE_RISK allows only reductions.
+      - LIQUIDATE_ONLY targets zero.
+      - KILL_PROCESS cancels/stops with no new orders.
+      - legacy check_circuit_breaker() still raises SystemExit.
+
+  - Gate: full mocked suite green.
+
+  ## Final Verification
+
+  - Run python -m pytest -q.
+  - Run mocked end-to-end replay:
+      - PIT snapshot built.
+      - strategist emits allocation.
+      - executor creates order intents.
+      - broker mock emits partial fills.
+      - portfolio manager applies fills.
+      - reconciliation clean.
+      - risk machine remains correct.
+      - orphaned hedges exit.
+
+  - Update README.md:1 with:
+      - Dual-Horizon Engine diagram.
+      - new modules.
+      - allocation matrix schema.
+      - model registry.
+      - PIT data rules.
+      - fill-based logging.
+      - risk state machine.
+      - no-live-API testing rule.
+
+  This produces a clean hierarchy: src/strategist.py:1 decides structural exposure, src/tactical_executor.py:1 times execution inside that exposure,
+  src/portfolio_manager.py:1 owns broker truth and FIFO, and src/guardrails.py:1 decides what actions are legal at every moment.
