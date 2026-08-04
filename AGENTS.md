@@ -22,3 +22,11 @@
 - **Mocking External APIs:** Absolutely FORBIDDEN to hit real Alpaca live or paper endpoints during tests. Use `unittest.mock` to mock all `alpaca-py` market data fetches and order placements.
 - **Deterministic Validation:** Write edge-case tests ensuring that inputs exceeding guardrails (e.g., trying to trade $10 when MAX_POSITION_SIZE = 5.00) strictly fail or clamp correctly.
 - **Self-Documentation:** Every time you add a new feature, modify file structures, or change configuration variables, you must immediately update the main `README.md` to accurately reflect these changes. Keep the architecture diagram/list pristine and completely up to date.
+
+## Version Control Workflow
+- **Branch Model:** `master` = production/stable, deployable only. `dev` = integration branch for reviewed work. `feature/<short-name>` = every meaningful code change starts here, branched off the latest `dev`.
+- **No Direct Commits:** Never commit directly to `master` or `dev`. All changes flow through a `feature/*` branch.
+- **Reviewable PRs:** Every feature branch merges via a Pull Request into `dev`. `dev` merges into `master` via a separate PR. Do not merge without explicit approval.
+- **Push Every Change:** After each code change, `git add` -> `git commit` with a clear message -> `git push` the feature branch to `origin`. Then surface the PR target and a suggested title/body.
+- **Test Before Push:** Run the relevant `pytest` checks before pushing a feature branch.
+- **Sandbox Note:** The `.git` directory is sandbox-locked, so git write operations (branch, commit, push) require escalated approval each session.
