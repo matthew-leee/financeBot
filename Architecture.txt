@@ -6,6 +6,45 @@ Architecture Rule
 
   ———
 
+  # IMPLEMENTATION STATUS ADDENDUM (2026-08-25)
+
+  Modules A–F above are implemented. This pass closed the two structural gaps
+  that kept the dual engine unable to run:
+
+  1. Political-economical ingestion (Module A completion):
+     - src/macro.py adds FredConnector (keyless fredgraph CSV), BlsConnector
+       (API v2/v1, key optional, series map empty by default), and
+       SecEdgarConnector (company_tickers.json -> submissions CIK JSON).
+     - Every connector emits vintage-safe PointInTimeRecords:
+       available_at = event_time + conservative publication lag per series
+       (config.FRED_SERIES lags; SEC filings knowable only post-close).
+     - populate_feature_store() + build_feature_store.py persist bars + macro +
+       filings into FEATURE_STORE_PATH as JSONL (atomic replace, corrupt-file
+       fail-closed reload).
+     - Interday snapshots gain cpi_yoy / cpi_yoy_chg_3m / unemployment /
+       unemployment_chg_3m / fed_funds_rate columns (missing indicators when
+       absent).
+
+  2. Dual-engine boot path (run_bot.py run_dual()):
+     - Hydrates the persisted store from disk before the empty-store gate;
+       gate behavior (SystemExit(1)) is unchanged for empty/corrupt state.
+
+  Strategic-layer upgrades (still inside Module C envelopes):
+     - optimize_core_portfolio(): deterministic long-only max-Sharpe tangency
+       construction (seed w ∝ pinv(Σ)μ | μ>0, fixed projected-gradient ascent),
+       USE_MAX_SHARPE_CORE toggles, legacy heuristic remains the fallback.
+     - predict_regime(): adds inflation_shock (CPI hot AND rising) and inverted
+       yield-curve growth_slowdown triggers; legacy vol/drawdown ladder intact.
+
+  Training path added: train_dual.py builds a leakage-safe panel from stored
+  snapshots, joins forward-return labels, validates via walk_forward_validate_panel,
+  and persists artifacts through model_io.save_registry_artifact("expected_return").
+
+  All new code paths are covered offline (tests/test_macro_connectors.py,
+  test_pit_persistence.py, test_max_sharpe_optimizer.py, test_train_dual.py).
+
+  ———
+
   # 0. Target System Topology
 
                      ┌────────────────────────────┐

@@ -79,9 +79,68 @@ preserved. The safe/default deployment path remains legacy:
     python run_bot.py                 # FINANCEBOT_ENGINE or legacy
     python run_bot.py --engine legacy # explicit legacy engine
 
-Dual execution is not VPS-deployment-ready in this patch. `run_dual()` now exits
-with `SystemExit(1)` when the point-in-time feature store is empty, rather than
-starting an order loop that can only emit empty allocations.
+Dual execution now has a production boot path:
+
+    python build_feature_store.py     # 1. populate + persist the PIT store
+    python train_dual.py              # 2. train + register expected_return model
+    python run_bot.py --engine dual   # 3. boots only if step 1 succeeded
+
+`run_dual()` hydrates the persisted point-in-time store from disk and still
+exits with `SystemExit(1)` when it is empty -- it refuses to trade on nothing.
+
+### Political-economical data pipeline (new)
+
+The strategic layer consumes long-horizon macro/filing state through the same
+anti-lookahead boundary as everything else:
+
+                      ┌────────────────────────────────────────┐
+     FRED (keyless) ──►│ src/macro.py connectors                │
+     BLS  (optional)──►│ vintage-safe available_at per series   │──► PointInTimeRecord
+     SEC EDGAR     ───►│ rate-limited, fail-closed, mockable    │         │
+                      └────────────────────────────────────────┘         ▼
+                                        Alpaca daily closes ──► data/feature_store/
+                                                                    records.jsonl
+
+- `FredConnector` pulls rates (`US3M/US2Y/US5Y/US10Y` yields), CPI and fed
+  funds from the keyless `fredgraph.csv` endpoint. Each series carries a
+  **conservative publication lag** (`config.FRED_SERIES`) so
+  `available_at = observation_date + lag`: revised macro history can never
+  leak backward into features.
+- `BlsConnector` posts to BLS public API v2/v1 (key optional via env,
+  series map empty by default).
+- `SecEdgarConnector` maps tickers -> CIK via `company_tickers.json`, then
+  emits `filing_date` records for tracked forms (10-K/10-Q/8-K/...), knowable
+  only after a conservative post-close lag.
+- Every connector wraps its transport in strict try/except, sleeps
+  `API_CALL_DELAY_SECONDS` before each call, and degrades to captured errors --
+  never raises into research or live loops. HTTP + sleep are injected seams;
+  tests never touch the network.
+
+The interday snapshot now also emits `cpi_yoy`, `cpi_yoy_chg_3m`,
+`unemployment`, `unemployment_chg_3m`, and `fed_funds_rate` (with automatic
+missing indicators when absent), feeding the regime classifier below.
+
+### Max-Sharpe core construction (new)
+
+`InterdayStrategist.optimize_core_portfolio()` now builds the core book with a
+deterministic **long-only max-Sharpe (tangency) construction**
+(`max_sharpe_weights()`): seed `w ∝ pinv(Σ)μ` restricted to μ > 0, refined by a
+fixed number of projected-gradient steps on `μᵀw / sqrt(wᵀΣw)`. Degenerate
+inputs fall back to the legacy inverse-volatility heuristic automatically
+(`USE_MAX_SHARPE_CORE` toggles this). Downstream safety is unchanged: vol-target
+scaling, symbol/gross/net caps, turnover smoothing, and the hard per-order
+`MAX_POSITION_SIZE` clamp all still apply after optimization.
+
+### Macro-aware regime classifier (new)
+
+`predict_regime()` keeps its legacy vol/drawdown ladder and adds two
+political-economical triggers when the macro columns exist:
+
+    crisis            drawdown <= -20%                     (legacy)
+    liquidity_stress  vol_63 >= 35%                        (legacy)
+    inflation_shock   cpi_yoy >= 4% AND rising (+0.2pp/3m) (new)
+    growth_slowdown   drawdown <= -10% OR inverted 10y-2y  (extended)
+    risk_on           otherwise
 
 ### Topology
 
@@ -182,6 +241,25 @@ submission with `client_order_id`, open-order counts, kill-switch cancels,
 and API health/error-rate telemetry. Legacy `src/trade_log.py` remains a
 shim for existing tests and the dashboard.
 
+### Cash-account guards (T+1 settlement reality)
+
+Paper trading never simulates settlement, but live cash accounts cannot reuse
+sell proceeds until T+1. Two guards close that gap (both env-toggleable,
+conservative by default):
+
+- **Settled-funds gate** (`src/portfolio_manager.py`) -- every BUY must fit
+  inside `get_withdrawable_cash()` (preference ladder:
+  `cash_withdrawable` → `non_marginable_buying_power` → `cash`) minus unfilled
+  buy commitments tracked in `models/portfolio_state.json`. Unknown funds fail
+  closed for buys; sells/reductions are always exempt so de-risking is never
+  blocked. Blocked orders are audited in `orders_log.csv` as
+  `blocked_settled_cash`.
+- **Turnover dampener** (`src/tactical_executor.py`) -- exposure-INCREASING
+  order deltas are scaled to `TURNOVER_DAMPING_FACTOR` (0.25) of desired size
+  and cooldown-limited to one increase per symbol per
+  `SYMBOL_RETRADE_COOLDOWN_SECONDS` (900). Reductions/exits pass through
+  untouched, always.
+
 ### Risk state machine
 
 `src/guardrails.RiskStateMachine` adds graduated states —
@@ -220,11 +298,15 @@ fills, fees, and slippage are validated exactly as in production. Legacy
 | `src/trade_log.py`         | Trade CSV writer; SELL PnL computed from FIFO inventory              |
 | `src/analytics.py`         | Shared PnL/win-rate/drawdown/Sharpe + open-inventory summary         |
 | `src/execution.py`         | Hardened legacy live loop: universe, clock gating, snapshots, risk gate |
-| `src/strategist.py`        | Interday Strategist: covariance, hedge overlay, allocation matrix    |
-| `src/tactical_executor.py` | Intraday Executor: envelopes → order intents inside risk state       |
-| `src/portfolio_manager.py` | Broker truth: fills, FIFO, reconciliation, orders/fills logs         |
+| `src/strategist.py`        | Interday Strategist: max-Sharpe core, covariance, hedge overlay, macro regime |
+| `src/tactical_executor.py` | Intraday Executor: envelopes → order intents inside risk state |
+| `src/portfolio_manager.py` | Broker truth: fills, FIFO, reconciliation, orders/fills logs |
+| `src/macro.py`             | FRED/BLS/EDGAR PIT connectors + feature-store population      |
+| `deploy/financebot.service`| systemd unit: restart policy, MemoryMax, env-file, hardening  |
 | `src/universe.py`          | Active live universe loader, schema validation, startup resolution    |
-| `train.py`                 | Training entrypoint                                                  |
+| `train.py`                 | Legacy direction-model training entrypoint                    |
+| `train_dual.py`            | Dual-engine expected_return training (panel walk-forward)     |
+| `build_feature_store.py`   | Offline PIT store population (bars + FRED/BLS/EDGAR)         |
 | `run_bot.py`               | Live entrypoint; `--engine` or `FINANCEBOT_ENGINE` selects engine    |
 | `backtest.py`              | Hybrid backtester with `--seed` + date-aligned sentiment mock       |
 | `dashboard.py`             | Read-only Streamlit + Plotly dashboard                              |
@@ -254,6 +336,9 @@ fills, fees, and slippage are validated exactly as in production. Legacy
 | `fills_log.csv`                 | `src/portfolio_manager.py`   | audit / realized PnL truth      |
 | `models/portfolio_state.json`   | `src/portfolio_manager.py`   | dual engine restart recovery    |
 | `models/risk_state.json`        | `src/guardrails.py`          | risk machine restart recovery   |
+| `data/feature_store/records.jsonl` | `build_feature_store.py`  | `run_dual()`, `train_dual.py`   |
+| `data/feature_store/news.jsonl`    | PIT store persistence     | `run_dual()` (news state)       |
+| `models/registry/registry.json`    | `train_dual.py` / registry| strategist model loading        |
 
 `trades_log.csv` schema: `timestamp,ticker,side,price,size,pnl`
 (`ticker` is the EXECUTED symbol -- target or inverse hedge; `pnl` is realized
@@ -311,6 +396,11 @@ ceiling with a warning.
 | `research`   | none       | none    | none         | `$5.00`      | `$10.00`       | `3`           |
 | `micro_live` | `0.02`     | `0.25`  | `0.005`      | `$100.00`    | `$50.00`       | `3`           |
 | `small_live` | `0.05`     | `0.50`  | `0.01`       | `$1000.00`   | `$250.00`      | `5`           |
+| `growth_live`| `0.12`     | `0.85`  | `0.03`       | `$5000.00`   | `$750.00`      | `8`           |
+
+At a $25k anchor, `growth_live` resolves to a $3,000/order cap (pct-bound),
+-$750 daily loss, 8 concurrent names. **`growth_live` is evidence-gated** --
+see "Promotion evidence gate" below.
 
 Exact formulas:
 
@@ -332,6 +422,38 @@ Pre-trade risk gate formulas:
 - Pending buys count toward symbol cap, gross exposure, and open-position count.
 - Exit/reduction orders remain prioritized when position truth is trusted, including when gross exposure is already high or equity is unknown.
 - Target caps exclude exit-only held symbols so removing a target does not force liquidation; risk calculations still include every broker/FIFO-held position and hedge.
+
+### Promotion evidence gate (`growth_live`)
+
+Bigger allowance must be earned. When `FINANCEBOT_RISK_PROFILE=growth_live`,
+`run_bot.py` calls `guardrails.verify_promotion_evidence()` at startup, BEFORE
+any broker initialization. The gate requires the operator-local trade logs to
+prove a qualifying prior-tier track record:
+
+- **>= 50 executed trades** in `trades_log.csv` (legacy) or `fills_log.csv` (dual),
+- **cumulative FIFO PnL > 0**,
+- **p95 |slippage_bps| <= 25** when slippage data exists (fills log),
+- current `risk_state.json` must not be `KILL_PROCESS`.
+
+Failure prints an itemized report and exits with `SystemExit(1)`. Missing or
+unreadable logs fail closed. Lower tiers are never gated.
+
+Escape hatch: `FINANCEBOT_ALLOW_UNEARNED_PROMOTION=true` arms the profile
+without evidence — and prints an explicit OVERRIDE banner at every startup so
+the choice is permanently visible in logs.
+
+Known limitation: major reconciliation breaks are not persisted as events yet;
+the gate approximates track-record quality from fills/PnL/slippage plus the
+current risk state. A `risk_events.csv` append-log is the noted follow-up.
+
+### Cost-aware entry gate (dual engine)
+
+`TacticalExecutor.process_symbol()` refuses exposure-INCREASING intents whose
+allocation-row `expected_return` does not clear
+`max(MIN_TRADE_EDGE_BPS=10, ESTIMATED_ROUND_TRIP_COST_BPS=20)` bps. A missing
+or non-finite estimate fails closed. Reductions/exits are never gated. At
+$1k+ clips this blocks most negative-EV churn — worth more than any cap raise.
+Legacy engine keeps its `BUY_THRESHOLD` proxy for now.
 
 ### Circuit breaker and market hours
 
@@ -360,6 +482,15 @@ Pre-trade risk gate formulas:
 | `FINANCEBOT_MAX_POSITION_SIZE_ABS` | positive float | optional tightening override |
 | `FINANCEBOT_DAILY_LOSS_LIMIT_ABS` | positive float | optional tightening override; stored as positive magnitude |
 | `FINANCEBOT_MAX_OPEN_POSITIONS` | positive int | optional tightening override |
+| `FRED_API_KEY` | str | optional; unused by default (keyless fredgraph endpoint) |
+| `BLS_API_KEY` | str | optional; switches BLS connector to API v2 |
+| `SEC_CONTACT_EMAIL` | str | optional; SEC requires a contact User-Agent |
+| `FINANCEBOT_ENFORCE_SETTLED_CASH_GATE` | bool | default `true`; blocks buys beyond settled cash |
+| `FINANCEBOT_CASH_ACCOUNT_DAMPING` | bool | default `true`; scales/cooldowns exposure increases in the dual executor |
+| `FINANCEBOT_ALLOW_UNEARNED_PROMOTION` | bool | default `false`; override the growth_live evidence gate (loudly logged) |
+| `MIN_TRADE_EDGE_BPS` / `ESTIMATED_ROUND_TRIP_COST_BPS` | float | code constants; dual-engine entry edge floor / cost model |
+
+Also see `README_SIMPLE.md` for a plain-language tour of the whole system.
 
 ## FIFO Realized PnL
 
@@ -416,7 +547,22 @@ The dashboard only ever *reads* files; it never routes orders or writes state.
 
 1. Python 3.11+ and install deps:
 
+   Debian/Ubuntu VPS note: there is no bare `python` binary by default -- use
+   a virtualenv, which gives you one (recommended, matches
+   `deploy/financebot.service`):
+
+       sudo apt install python3-venv python3-pip
+       python3 -m venv .venv
+       source .venv/bin/activate     # now `python` works inside this shell
        pip install -r requirements.txt
+
+   Or, system-wide alias instead of a venv:
+
+       sudo apt install python-is-python3
+       pip install -r requirements.txt
+
+   All later commands (`python train.py`, `python -m pytest -q`,
+   `streamlit run dashboard.py`) assume that venv is activated.
 
 2. Set credentials (never hard-coded):
 
@@ -452,6 +598,12 @@ The dashboard only ever *reads* files; it never routes orders or writes state.
        python backtest.py --seed 42       # reproducible local/offline backtest
        streamlit run dashboard.py         # read-only local monitor
 
+   Dual-horizon engine (opt-in, after legacy is stable):
+
+       python build_feature_store.py      # populate + persist PIT store (once)
+       python train_dual.py               # train + register strategist model
+       python run_bot.py --engine dual    # strategic + tactical engine
+
 ## Legacy Paper VPS Deployment Path
 
 This patch hardens the **legacy** engine for restricted paper execution on a
@@ -465,7 +617,10 @@ Recommended order:
 2. **Prepare universe** -- copy `active_universe.example.json` to `active_universe.json`, update `as_of`, and trim to the initial 15-25 targets.
 3. **Paper VPS start** -- run `FINANCEBOT_PAPER=true`, `FINANCEBOT_ENGINE=legacy`, `FINANCEBOT_RISK_PROFILE=micro_live`, and strict universe mode.
 4. **Soak and inspect** -- watch loop telemetry, broker-health warnings, cancellation behavior, `trades_log.csv`, FIFO state, and circuit-breaker anchor state.
-5. **Keep dual blocked** -- `FINANCEBOT_ENGINE=dual` exits if the point-in-time feature store is empty because no production persisted-data loader exists yet.
+5. **Dual remains opt-in until soaked** -- `FINANCEBOT_ENGINE=dual` boots only
+   after `build_feature_store.py` has populated the persisted PIT store; it still
+   refuses (`SystemExit(1)`) on an empty or corrupt store. Promote it to paper
+   default only after a clean dual-engine soak.
 
 Example Linux VPS environment:
 
@@ -478,6 +633,11 @@ Example Linux VPS environment:
     export FINANCEBOT_UNIVERSE_FILE="/opt/financebot/active_universe.json"
     export FINANCEBOT_MAX_LIVE_UNIVERSE_SIZE="25"
     python run_bot.py
+
+Or run it as a service with restart policy, memory cap, and env-file:
+
+    sudo cp deploy/financebot.service /etc/systemd/system/
+    sudo systemctl daemon-reload && sudo systemctl enable --now financebot
 
 Expected startup/loop telemetry:
 
@@ -492,10 +652,11 @@ Why the 15-25 target recommendation:
 - A 45-50 symbol universe can make the first paper deployment too slow on a 2-vCPU/4-GB VPS.
 - `MAX_LIVE_UNIVERSE_SIZE` remains `50`, but start smaller and scale only after telemetry is clean.
 
-Dual VPS execution remains blocked because `run_dual()` constructs an empty
-`PointInTimeFeatureStore` and this patch intentionally does not implement a
-production persisted feature-store loader. Backtest dual replay remains
-unchanged; a future change may add and validate persisted dual feature loading.
+Dual VPS execution requires a populated feature store: run
+`python build_feature_store.py` (Alpaca bars + FRED + BLS + EDGAR into
+`data/feature_store/records.jsonl`), then `python train_dual.py` to register the
+strategist's `expected_return` model. Without those artifacts `run_dual()` fails
+closed before any broker initialization.
 
 For the local admin model, prefer a separate service boundary (for example
 Ollama for simple Gemma/Qwen deployment, or vLLM on a GPU VPS). Give it
@@ -559,6 +720,24 @@ entire dual engine is exercised with mocks, doubles, and in-memory stores:
   `MAX_POSITION_SIZE` re-cap, freeze blocks entries, kill cancels + exits.
 - `tests/test_dual_replay.py` — full mocked strategist→executor→PM→fills replay.
 - `tests/test_run_bot_hardening.py` — empty PIT feature store exits before broker initialization.
+- `tests/test_macro_connectors.py` — FRED/BLS/EDGAR parsing, publication-lag
+  vintage safety, rate limiting, fail-closed transport failures, and store
+  population (all transports mocked; zero network).
+- `tests/test_pit_persistence.py` — JSONL round-trip, vintage gating after
+  reload, corrupt-file fail-closed behavior, `latest_available_at()` telemetry.
+- `tests/test_max_sharpe_optimizer.py` — tangency beats heuristic on crafted
+  correlated inputs, determinism, long-only + cap compliance, degenerate-mu
+  fallback, and every macro regime transition.
+- `tests/test_train_dual.py` — panel builder leakage safety (label_end_time >
+  timestamp, labels inside stored history) on a synthetic store.
+- `tests/test_cash_account_guards.py` — settled-funds gate (submit/block/
+  fail-closed/fallback/pending-release/config-off), sells exempt, and every
+  turnover-dampener rule (scale, cooldown, reduction passthrough, disable).
+- `tests/test_promotion_gate.py` — growth_live arming blocked without logs /
+  short history / negative PnL / slippage-p95 breach / KILL state; qualifying
+  record passes; lower tiers never gated; override banner path.
+- `tests/test_risk_profiles.py` + growth_live exact formulas at $10k/$25k
+  anchors, tighten-only overrides, and gated-profile set contract.
 
 ## Notes / Next Steps
 

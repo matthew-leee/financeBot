@@ -119,6 +119,14 @@ def _wire_loop(monkeypatch, tmp_path, *, sentiment, universe, prob_up):
     monkeypatch.setattr(config, "TRADES_LOG_PATH", str(tmp_path / "trades_log.csv"))
     monkeypatch.setattr(config, "INVENTORY_STATE_PATH", str(tmp_path / "inventory.json"))
     monkeypatch.setattr(config, "STATE_PATH", str(tmp_path / "bot_state.json"))
+    # Hermetic model artifacts: run() fail-fasts on missing files before
+    # reaching the stubbed load_model(), so point it at tiny placeholders.
+    model_path = tmp_path / "model.json"
+    meta_path = tmp_path / "feature_meta.json"
+    model_path.write_text("{}")
+    meta_path.write_text("{}")
+    monkeypatch.setattr(config, "MODEL_PATH", str(model_path))
+    monkeypatch.setattr(config, "FEATURE_META_PATH", str(meta_path))
     monkeypatch.setattr(config, "EQUITY_SYMBOLS", ["AAPL"])
     monkeypatch.setattr(config, "CRYPTO_SYMBOLS", [])
     # Resolve the live universe deterministically so an operator-local
@@ -186,16 +194,22 @@ def test_run_loop_direct_buy_on_strong_sentiment(monkeypatch, tmp_path) -> None:
 
 def test_run_loop_survives_symbol_error(monkeypatch, tmp_path) -> None:
     """A fetch failure on one symbol must not crash the whole loop."""
-
-    def _boom(symbol, lookback_days):
-        raise RuntimeError("simulated data outage")
-
     monkeypatch.setattr(config, "TRADES_LOG_PATH", str(tmp_path / "trades_log.csv"))
     monkeypatch.setattr(config, "INVENTORY_STATE_PATH", str(tmp_path / "inventory.json"))
     monkeypatch.setattr(config, "STATE_PATH", str(tmp_path / "bot_state.json"))
+    # Hermetic model artifacts (same rationale as _wire_loop above).
+    model_path = tmp_path / "model.json"
+    meta_path = tmp_path / "feature_meta.json"
+    model_path.write_text("{}")
+    meta_path.write_text("{}")
+    monkeypatch.setattr(config, "MODEL_PATH", str(model_path))
+    monkeypatch.setattr(config, "FEATURE_META_PATH", str(meta_path))
     monkeypatch.setattr(config, "EQUITY_SYMBOLS", ["AAPL"])
     monkeypatch.setattr(config, "CRYPTO_SYMBOLS", [])
     monkeypatch.setattr(execution, "resolve_live_universe", lambda: ["AAPL"])
+
+    def _boom(symbol, lookback_days):
+        raise RuntimeError("simulated data outage")
 
     broker = StubBroker()
     monkeypatch.setattr(execution, "load_model", lambda: StubModel(config.BUY_THRESHOLD + 0.05))

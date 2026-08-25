@@ -485,6 +485,20 @@ _RISK_PROFILES: dict[str, RiskPolicy] = {
         daily_loss_limit_abs=250.00,
         max_open_positions=5,
     ),
+    # Sized for ~$10k-30k equity. At a $25k anchor: order cap
+    # min($5000, 0.12*$25k)=$3000, daily loss -min($750, 0.03*$25k)=-$750.
+    # ARMING IS EVIDENCE-GATED: see verify_promotion_evidence() below -- this
+    # profile refuses to start without a qualifying prior-tier track record
+    # unless the operator explicitly overrides (loudly, in the logs).
+    "growth_live": RiskPolicy(
+        profile="growth_live",
+        max_position_pct=0.12,
+        max_gross_exposure_pct=0.85,
+        daily_loss_pct=0.03,
+        max_position_size_abs=5000.00,
+        daily_loss_limit_abs=750.00,
+        max_open_positions=8,
+    ),
 }
 
 
@@ -640,3 +654,164 @@ def resolve_daily_loss_threshold(
     ):
         return -abs_limit
     return -min(abs_limit, float(anchor_equity) * policy.daily_loss_pct)
+
+
+# ===========================================================================
+# ADDITIVE: Promotion evidence gate (growth_live and future tiers)
+# ===========================================================================
+# Bigger allowance must be EARNED. A tier listed in _EVIDENCE_GATED_PROFILES
+# refuses to arm unless the operator-local trade logs prove a qualifying
+# prior-tier track record: enough fills, positive net FIFO PnL, and contained
+# slippage. The check runs once at startup, before any broker initialization,
+# and fails closed (caller exits) -- same philosophy as the model-artifact
+# gate. An explicit operator override exists but shouts about itself.
+
+_EVIDENCE_GATED_PROFILES: frozenset[str] = frozenset({"growth_live"})
+
+ALLOW_UNEARNED_PROMOTION_ENV = "FINANCEBOT_ALLOW_UNEARNED_PROMOTION"
+
+
+class PromotionEvidenceError(RuntimeError):
+    """Raised when a promotion-gated profile lacks qualifying track record."""
+
+
+def _promotion_env_flag(name: str) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def verify_promotion_evidence(
+    profile: str,
+    *,
+    trades_log_path: str | None = None,
+    fills_log_path: str | None = None,
+    risk_state_path: str | None = None,
+    min_trades: int = 50,
+    max_slippage_bps_p95: float = 25.0,
+) -> None:
+    """
+    Gate promotion-gated profiles behind prior-tier fill evidence.
+
+    Checks, in order:
+      1. Operator override ``FINANCEBOT_ALLOW_UNEARNED_PROMOTION`` truthy ->
+         print an explicit banner and return (allowed, but loud forever).
+      2. Profile not gated (research/micro_live/small_live) -> return.
+      3. Risk state file must not be KILL_PROCESS.
+      4. Trade evidence from trades_log.csv (legacy schema) or fills_log.csv
+         (dual schema): >= min_trades executed rows AND cumulative FIFO PnL
+         strictly > 0 AND (when slippage data exists) p95 |slippage_bps| <=
+         max_slippage_bps_p95.
+
+    Raises PromotionEvidenceError with a human-readable report on failure.
+    Missing/unreadable logs fail closed. Known limitation (documented):
+    major reconciliation breaks are not persisted as events yet, so this gate
+    approximates track-record quality from fills/PnL/slippage + current risk
+    state only.
+    """
+    import csv as _csv
+
+    if profile not in _EVIDENCE_GATED_PROFILES:
+        return
+
+    if _promotion_env_flag(ALLOW_UNEARNED_PROMOTION_ENV):
+        print(
+            f"[risk] OVERRIDE ACTIVE -- {ALLOW_UNEARNED_PROMOTION_ENV}=true: "
+            f"arming '{profile}' WITHOUT earned evidence. This is logged "
+            f"every startup on purpose."
+        )
+        return
+
+    problems: list[str] = []
+
+    # 3) Current risk state sanity.
+    state_path = risk_state_path or config.RISK_STATE_PATH
+    try:
+        if os.path.exists(state_path):
+            with open(state_path, "r", encoding="utf-8") as fh:
+                state_raw = (json.load(fh) or {}).get("state", "")
+            if str(state_raw).upper() == RiskState.KILL_PROCESS.value:
+                problems.append(
+                    f"  - risk state is KILL_PROCESS ({state_path}); resolve the "
+                    f"kill condition and reset state before promoting."
+                )
+    except Exception as exc:  # noqa: BLE001 -- unreadable state fails closed
+        problems.append(f"  - could not read risk state {state_path}: {exc}")
+
+    # 4) Fill/trade evidence. Prefer legacy trades log; fall back to fills log.
+    def _read_rows(path: str) -> list[dict]:
+        with open(path, "r", newline="", encoding="utf-8") as fh:
+            return list(_csv.DictReader(fh))
+
+    rows: list[dict] | None = None
+    source = "none"
+    for candidate, label in (
+        (trades_log_path or config.TRADES_LOG_PATH, "trades_log"),
+        (fills_log_path or config.FILLS_LOG_PATH, "fills_log"),
+    ):
+        try:
+            if os.path.exists(candidate):
+                rows = _read_rows(candidate)
+                source = label
+                break
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"  - could not read {label} at {candidate}: {exc}")
+
+    n_trades = 0
+    total_pnl = 0.0
+    slippages: list[float] = []
+    if rows is None:
+        if not problems:
+            problems.append(
+                "  - no trade history found (trades_log.csv / fills_log.csv "
+                "missing). Run the previous profile long enough to build a "
+                "track record first."
+            )
+    else:
+        n_trades = len(rows)
+        pnl_key = "pnl" if source == "trades_log" else "realized_pnl"
+        slip_key = "slippage_bps"
+        for row in rows:
+            try:
+                total_pnl += float(row.get(pnl_key) or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                raw_slip = row.get(slip_key)
+                if raw_slip not in (None, ""):
+                    slippages.append(abs(float(raw_slip)))
+            except (TypeError, ValueError):
+                continue
+
+        if n_trades < int(min_trades):
+            problems.append(
+                f"  - only {n_trades} executed trades in {source} "
+                f"(need >= {min_trades})."
+            )
+        if not total_pnl > 0.0:
+            problems.append(
+                f"  - cumulative net PnL is {total_pnl:.2f} "
+                f"(must be > 0.00) in {source}."
+            )
+        if slippages:
+            srt = sorted(slippages)
+            rank = max(0, int(round(0.95 * (len(srt) - 1))))
+            p95 = srt[rank]
+            if p95 > float(max_slippage_bps_p95):
+                problems.append(
+                    f"  - p95 slippage {p95:.1f}bps exceeds budget "
+                    f"{float(max_slippage_bps_p95):.1f}bps in {source}."
+                )
+
+    if problems:
+        raise PromotionEvidenceError(
+            f"Evidence gate for profile '{profile}' FAILED:\n"
+            + "\n".join(problems)
+            + "\n\n  >> Earn the promotion in a lower tier first, or set "
+            f"{ALLOW_UNEARNED_PROMOTION_ENV}=true explicitly (logged)."
+        )
+    print(
+        f"[risk] Evidence gate PASSED for '{profile}': {n_trades} trades, "
+        f"net PnL {total_pnl:.2f}, {len(slippages)} slippage samples."
+    )

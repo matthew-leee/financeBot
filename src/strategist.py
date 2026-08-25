@@ -54,6 +54,8 @@ class StrategistConfig:
     min_hedge_effectiveness: float
     news_tau_days: float = float(config.NEWS_TAU_DAYS)
     allow_core_shorts: bool = False
+    use_max_sharpe: bool = bool(getattr(config, "USE_MAX_SHARPE_CORE", True))
+    max_sharpe_iterations: int = 200
 
     @classmethod
     def from_config(cls) -> "StrategistConfig":
@@ -74,6 +76,7 @@ class StrategistConfig:
             hedge_decay_penalty_bps=config.HEDGE_DECAY_PENALTY_BPS,
             min_hedge_effectiveness=config.MIN_HEDGE_EFFECTIVENESS,
             news_tau_days=float(config.NEWS_TAU_DAYS),
+            use_max_sharpe=bool(getattr(config, "USE_MAX_SHARPE_CORE", True)),
         )
 
 
@@ -294,7 +297,18 @@ class InterdayStrategist:
         return (raw - stale_penalty).fillna(0.0)
 
     def predict_regime(self, features: pd.DataFrame) -> str:
-        """Predict a coarse macro regime label from interday features."""
+        """Predict a coarse macro regime label from interday features.
+
+        Deterministic ladder, strictest first:
+            crisis            -- deep drawdown
+            liquidity_stress  -- elevated realized volatility
+            inflation_shock   -- CPI YoY at/above shock level AND still rising
+            growth_slowdown   -- material drawdown OR inverted yield curve
+            risk_on           -- otherwise
+
+        Macro columns (cpi_yoy, cpi_yoy_chg_3m, curve_10y_2y) are optional:
+        when absent the classifier degrades to the legacy vol/drawdown rules.
+        """
         if self.model_registry is not None:
             try:
                 pred = self.model_registry.predict("regime", features)
@@ -305,15 +319,40 @@ class InterdayStrategist:
 
         if features.empty:
             return "risk_on"
-        avg_vol = float(features.get("vol_63", pd.Series(dtype="float64")).mean())
-        avg_dd = float(features.get("drawdown_252", pd.Series(dtype="float64")).mean())
+
+        def _avg(col: str) -> float:
+            series = features.get(col)
+            if series is None or series.empty:
+                return float("nan")
+            return float(series.mean())
+
+        avg_vol = _avg("vol_63")
+        avg_dd = _avg("drawdown_252")
+        cpi_yoy = _avg("cpi_yoy")
+        cpi_chg = _avg("cpi_yoy_chg_3m")
+        slope = _avg("curve_10y_2y")
+
         if np.isnan(avg_vol) and np.isnan(avg_dd):
             return "risk_on"
+
+        # 1) crisis (unchanged legacy threshold).
         if not np.isnan(avg_dd) and avg_dd <= -0.20:
             return "crisis"
+        # 2) liquidity stress (unchanged legacy threshold).
         if not np.isnan(avg_vol) and avg_vol >= 0.35:
             return "liquidity_stress"
+        # 3) inflation shock: hot AND accelerating CPI.
+        if (
+            not np.isnan(cpi_yoy)
+            and cpi_yoy >= config.REGIME_CPI_YOY_SHOCK_LEVEL
+            and not np.isnan(cpi_chg)
+            and cpi_chg >= config.REGIME_CPI_YOY_RISE_3M
+        ):
+            return "inflation_shock"
+        # 4) growth slowdown: legacy drawdown rule + inverted-curve signal.
         if not np.isnan(avg_dd) and avg_dd <= -0.10:
+            return "growth_slowdown"
+        if not np.isnan(slope) and slope < config.REGIME_INVERTED_CURVE_SLOPE:
             return "growth_slowdown"
         return "risk_on"
 
@@ -421,6 +460,81 @@ class InterdayStrategist:
 
     # -- core optimization ---------------------------------------------------
 
+    def max_sharpe_weights(
+        self,
+        *,
+        expected_returns: pd.Series,
+        covariance: pd.DataFrame,
+    ) -> pd.Series | None:
+        """
+        Long-only maximum-Sharpe (tangency) weights, deterministic.
+
+        Method:
+            1. Seed with w ∝ pinv(Σ)μ restricted to μ > 0 (classic tangency
+               solution), long-only clipped and gross-normalized.
+            2. Refine with a FIXED number of projected-gradient-ascent steps on
+               S(w) = μᵀw / sqrt(wᵀΣw). Same inputs always produce the same
+               weights -- no randomness anywhere.
+            3. Return None when no asset has a positive expected return or the
+               math degenerates, so callers fall back to the heuristic path.
+
+        Note on horizons: expected returns share one horizon convention, so the
+        argmax of Sharpe is unaffected by annualization constants; downstream
+        code rescales to the volatility target regardless.
+        """
+        symbols = [s for s in expected_returns.index if s in covariance.index]
+        if len(symbols) < 1:
+            return None
+
+        mu = expected_returns.reindex(symbols).fillna(0.0).to_numpy(dtype="float64")
+        sigma = covariance.loc[symbols, symbols].to_numpy(dtype="float64")
+        sigma = _psd_floor(sigma, self.config.covariance_eigen_floor)
+
+        positive = mu > 0.0
+        if not positive.any():
+            return None
+
+        # Step 1: tangency seed via pseudo-inverse (stable for singular Sigma).
+        try:
+            w = np.linalg.pinv(sigma) @ mu
+        except np.linalg.LinAlgError:
+            return None
+        if not np.all(np.isfinite(w)):
+            return None
+        w = np.where(positive, np.clip(w, 0.0, None), 0.0)
+        total = float(w.sum())
+        if total <= _EPS:
+            # Degenerate seed -> equal weight across positive-mu names.
+            w = positive.astype("float64")
+            total = float(w.sum())
+        w = w / total
+
+        # Step 2: fixed-step projected gradient ascent on Sharpe.
+        step = 0.05
+        for _ in range(max(int(self.config.max_sharpe_iterations), 1)):
+            q = float(w @ sigma @ w)
+            if not np.isfinite(q) or q <= _EPS:
+                break
+            qw = np.sqrt(q)
+            grad = mu / qw - (float(mu @ w) / (q * qw)) * (sigma @ w)
+            if not np.all(np.isfinite(grad)):
+                break
+            candidate = np.clip(w + step * grad, 0.0, None)
+            cand_total = float(candidate.sum())
+            if cand_total <= _EPS:
+                break
+            candidate = candidate / cand_total
+            # Keep the step only when Sharpe does not deteriorate (monotone).
+            s_new = float(mu @ candidate) / np.sqrt(float(candidate @ sigma @ candidate))
+            s_old = float(mu @ w) / np.sqrt(q)
+            if np.isfinite(s_new) and s_new >= s_old - 1e-12:
+                w = candidate
+            else:
+                break
+
+        result = pd.Series(w, index=symbols, dtype="float64")
+        return result[result > 0.0] if bool((result > 0.0).any()) else None
+
     def optimize_core_portfolio(
         self,
         *,
@@ -449,12 +563,29 @@ class InterdayStrategist:
         else:
             keep = score.abs() > 0.0
 
-        raw = pd.Series(0.0, index=symbols, dtype="float64")
-        raw[keep] = score[keep] / vol[keep].clip(lower=_EPS)
-        gross = raw.abs().sum()
-        if gross <= _EPS:
-            return pd.Series(0.0, index=symbols, dtype="float64")
-        weights = raw / gross
+        weights: pd.Series | None = None
+
+        # Primary path: long-only max-Sharpe tangency construction.
+        if cfg.use_max_sharpe and not cfg.allow_core_shorts and keep.any():
+            kept_syms = [s for s in symbols if bool(keep[s])]
+            try:
+                ms = self.max_sharpe_weights(
+                    expected_returns=mu[kept_syms], covariance=sigma.loc[kept_syms, kept_syms]
+                )
+            except Exception:  # noqa: BLE001 -- optimizer must never crash allocation
+                ms = None
+            if ms is not None and not ms.empty:
+                weights = pd.Series(0.0, index=symbols, dtype="float64")
+                weights.loc[ms.index] = ms
+
+        # Fallback heuristic: inverse-volatility-scaled momentum score.
+        if weights is None:
+            raw = pd.Series(0.0, index=symbols, dtype="float64")
+            raw[keep] = score[keep] / vol[keep].clip(lower=_EPS)
+            gross = raw.abs().sum()
+            if gross <= _EPS:
+                return pd.Series(0.0, index=symbols, dtype="float64")
+            weights = raw / gross
 
         # Scale to the annualized volatility target.
         port_vol = float(np.sqrt(max(weights.values @ sigma.to_numpy() @ weights.values, _EPS)))

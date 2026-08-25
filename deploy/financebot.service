@@ -1,0 +1,56 @@
+# financeBot systemd unit (paper VPS deployment).
+#
+# Install:
+#   sudo cp deploy/financebot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now financebot
+#
+# Secrets/config live in /etc/financebot.env (chmod 600, root-owned), e.g.:
+#   APCA_API_KEY_ID=...
+#   APCA_API_SECRET_KEY=...
+#   FINANCEBOT_PAPER=true
+#   FINANCEBOT_ENGINE=legacy
+#   FINANCEBOT_RISK_PROFILE=micro_live
+#   FINANCEBOT_UNIVERSE_STRICT=true
+#
+# Restart policy notes:
+#   - The bot exits with code 1 on INTENTIONAL kill-states (circuit breaker,
+#     KILL_PROCESS). on-failure restarts are acceptable because every state
+#     machine reloads persisted state at boot -- but pair this unit with an
+#     alert on repeated exits (journalctl -u financebot -g "Exited").
+#   - MemoryMax caps the bot so co-located workloads (e.g. hermes) can never
+#     starve it mid-position; OOM inside the service beats account-blind death.
+
+[Unit]
+Description=financeBot algo trading loop (alpaca paper)
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=financebot
+Group=financebot
+WorkingDirectory=/opt/financebot
+EnvironmentFile=/etc/financebot.env
+ExecStart=/opt/financebot/.venv/bin/python /opt/financebot/run_bot.py
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+# Hardening: keep blast radius small.
+MemoryMax=2G
+MemoryHigh=1500M
+Nice=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+
+# Logging -> journald; rotate via journald defaults.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=financebot
+
+[Install]
+WantedBy=multi-user.target

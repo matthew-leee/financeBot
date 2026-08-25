@@ -46,6 +46,7 @@ class _FakeStrategist:
                 direction_bias="long",
                 volatility_ceiling=0.12,
                 rebalance_priority=0.1,
+                expected_return=0.01,  # 100bps: clears the cost-aware entry gate
             ),
             # HDG is no longer wanted -> target zero so the executor exits it.
             "HDG": TargetAllocation(

@@ -179,6 +179,47 @@ def convert_weight_delta_to_order_intent(
     )
 
 
+def apply_turnover_dampening(
+    delta_weight: float,
+    *,
+    last_increase_at: datetime | None,
+    now: datetime,
+    enabled: bool = True,
+    factor: float | None = None,
+    cooldown_seconds: float | None = None,
+) -> tuple[float, bool]:
+    """
+    Cash-account churn control for exposure-INCREASING deltas.
+
+    Returns (damped_delta, blocked):
+        * delta <= 0 (reductions/exits) pass through untouched, always.
+        * increases are scaled to `factor` of the desired delta...
+        * ...and blocked entirely while inside the per-symbol re-trade
+          cooldown measured from the last submitted increase.
+
+    Deterministic pure function; the executor owns the timestamp bookkeeping.
+    """
+    factor = config.TURNOVER_DAMPING_FACTOR if factor is None else factor
+    cooldown = (
+        config.SYMBOL_RETRADE_COOLDOWN_SECONDS
+        if cooldown_seconds is None
+        else cooldown_seconds
+    )
+    if not enabled or delta_weight <= _EPS:
+        return delta_weight, False
+
+    if last_increase_at is not None:
+        last_utc = last_increase_at if last_increase_at.tzinfo else last_increase_at.replace(
+            tzinfo=timezone.utc
+        )
+        now_utc = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        elapsed = (now_utc - last_utc).total_seconds()
+        if elapsed < max(float(cooldown), 0.0):
+            return 0.0, True
+
+    return delta_weight * max(min(float(factor), 1.0), 0.0), False
+
+
 class TacticalExecutor:
     """Continuous intraday executor bound to strategist + risk envelopes."""
 
@@ -203,6 +244,9 @@ class TacticalExecutor:
             seconds=config.ALLOCATION_STALE_SECONDS
         )
         self._allocation: AllocationMatrix | None = None
+        # symbol -> UTC timestamp of the last submitted exposure-increasing
+        # order; drives the cash-account re-trade cooldown.
+        self._last_increase_ts: dict[str, datetime] = {}
 
     # -- main loop -----------------------------------------------------------
 
@@ -443,6 +487,28 @@ class TacticalExecutor:
         snapshot = self.portfolio_manager.snapshot()
         current_weight = snapshot.weight(symbol)
 
+        # Cost-aware entry gate: an exposure INCREASE must clear both a hard
+        # edge floor and the estimated round-trip cost. A missing or non-finite
+        # expected return fails closed -- never size up blindly. Reductions
+        # and exits are never gated; getting safer is always worth the trip.
+        desired_delta_weight = target_weight - current_weight
+        if desired_delta_weight > _EPS:
+            raw_expected = getattr(target, "expected_return", None)
+            try:
+                mu_bps = float(raw_expected) * 10000.0 if raw_expected is not None else float("nan")
+            except (TypeError, ValueError):
+                mu_bps = float("nan")
+            required_edge_bps = max(
+                float(config.MIN_TRADE_EDGE_BPS),
+                float(config.ESTIMATED_ROUND_TRIP_COST_BPS),
+            )
+            if not math.isfinite(mu_bps) or mu_bps < required_edge_bps:
+                reason = "no edge estimate" if not math.isfinite(mu_bps) else (
+                    f"edge {mu_bps:.1f}bps < required {required_edge_bps:.1f}bps"
+                )
+                print(f"[executor] skip entry {symbol}: {reason}.")
+                return None
+
         intraday = self.feature_store.build_intraday_snapshot(
             symbols=[symbol],
             as_of=now,
@@ -452,8 +518,6 @@ class TacticalExecutor:
             return None
         features = intraday.frame.loc[symbol]
         signal = compute_tactical_signal(symbol=symbol, intraday_features=features)
-
-        desired_delta_weight = target_weight - current_weight
 
         if current_weight < min_weight or current_weight > max_weight:
             urgency = 1.0  # out of envelope -> act regardless of timing edge
@@ -467,6 +531,19 @@ class TacticalExecutor:
             risk_decision=risk_decision,
         )
         allowed_delta *= urgency * signal.confidence
+
+        # Cash-account turnover dampener: scale and cooldown exposure
+        # INCREASES only. Reductions pass through so de-risking is never slow.
+        if allowed_delta > _EPS:
+            damped, blocked = apply_turnover_dampening(
+                allowed_delta,
+                last_increase_at=self._last_increase_ts.get(symbol),
+                now=now,
+                enabled=bool(getattr(config, "CASH_ACCOUNT_TURNOVER_DAMPING", True)),
+            )
+            if blocked:
+                return None
+            allowed_delta = damped
 
         if abs(allowed_delta) < config.MINIMUM_TRADE_WEIGHT:
             return None
@@ -492,6 +569,8 @@ class TacticalExecutor:
             return None
 
         self.portfolio_manager.submit_order_intent(intent)
+        if allowed_delta > _EPS:
+            self._last_increase_ts[symbol] = now
         return intent
 
     def apply_risk_state_rules(

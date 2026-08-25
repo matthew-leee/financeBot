@@ -144,6 +144,60 @@ class Broker:
             print(f"[broker] get_cash failed: {exc}")
             return None
 
+    def get_withdrawable_cash(self) -> "float | None":
+        """
+        Settled/spendable cash, or None when unknown (callers fail closed).
+
+        Preference ladder, first available wins:
+          1. ``cash_withdrawable`` -- explicit withdrawable balance when the
+             account payload exposes it,
+          2. ``non_marginable_buying_power`` -- on cash accounts this reflects
+             SETTLED funds only (T+1 settlement aware),
+          3. ``cash`` -- last resort, may include unsettled proceeds.
+
+        On a T+1 cash account this is THE number buys must respect; unsettled
+        sell proceeds are invisible here by construction.
+        """
+        self._throttle()
+        try:
+            acct = self._client.get_account()
+            self._note(True, health=True)
+            for attr in ("cash_withdrawable", "non_marginable_buying_power", "cash"):
+                try:
+                    raw = getattr(acct, attr, None)
+                except Exception:  # noqa: BLE001 -- odd payloads degrade to next attr
+                    continue
+                if raw is None:
+                    continue
+                val = float(raw)
+                if math.isfinite(val):
+                    return val
+            print("[broker] get_withdrawable_cash: no usable cash attribute.")
+            return None
+        except Exception as exc:  # noqa: BLE001
+            self._note(False, health=True)
+            print(f"[broker] get_withdrawable_cash failed: {exc}")
+            return None
+
+    def is_cash_account(self) -> "bool | None":
+        """True/False when knowable, None when the payload does not say."""
+        self._throttle()
+        try:
+            acct = self._client.get_account()
+            self._note(True, health=True)
+        except Exception as exc:  # noqa: BLE001
+            self._note(False, health=True)
+            print(f"[broker] is_cash_account failed: {exc}")
+            return None
+
+        account_type = str(getattr(acct, "account_type", "") or "").strip().lower()
+        if account_type in ("cash", "margin"):
+            return account_type == "cash"
+        shorting = getattr(acct, "shorting_enabled", None)
+        if shorting is None:
+            return None
+        return not bool(shorting)
+
     def get_open_positions(self) -> list:
         """List of open positions; empty list on failure."""
         self._throttle()

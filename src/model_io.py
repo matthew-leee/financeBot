@@ -314,3 +314,64 @@ class ModelRegistry:
     def predict(self, role: ModelRole, features: pd.DataFrame) -> pd.Series:
         """Order features per artifact metadata, then call the role model."""
         return self.load(role).predict(features)
+
+
+def save_registry_artifact(
+    role: str,
+    model: object,
+    *,
+    feature_columns: tuple[str, ...] | list[str],
+    horizon: Literal["interday", "intraday"] = "interday",
+    validation: dict | None = None,
+    registry_dir: str | None = None,
+) -> str:
+    """
+    Persist a trained role model + register it in <registry_dir>/registry.json.
+
+    Additive training-side helper: writes the native XGBoost artifact to
+    <registry_dir>/<role>.json and merges the metadata entry into registry.json
+    without touching unrelated roles. Returns the written model path.
+
+    The live ModelRegistry picks this up on next construction, so a freshly
+    trained strategist model is verified and loaded with strict column order.
+    """
+    import datetime as _dt
+
+    directory = registry_dir or config.MODEL_REGISTRY_DIR
+    os.makedirs(directory, exist_ok=True)
+
+    model_path = os.path.join(directory, f"{role}.json")
+    save_fn = getattr(model, "save_model", None)
+    if not callable(save_fn):
+        raise ModelArtifactError(
+            f"Model for role '{role}' has no save_model() -- cannot persist."
+        )
+    save_fn(model_path)
+    if not os.path.exists(model_path) or os.path.getsize(model_path) < _MIN_ARTIFACT_BYTES:
+        raise ModelArtifactError(
+            f"Model artifact for role '{role}' was not written correctly."
+        )
+
+    entry = {
+        "model_path": model_path,
+        "feature_columns": list(feature_columns),
+        "horizon": horizon,
+        "validation": validation or {},
+        "trained_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }
+
+    registry_path = os.path.join(directory, "registry.json")
+    registry: dict = {}
+    if os.path.exists(registry_path):
+        try:
+            with open(registry_path, "r", encoding="utf-8") as fh:
+                registry = json.load(fh) or {}
+        except Exception as exc:  # noqa: BLE001 -- rebuild rather than crash training
+            print(f"[model_io] Registry unreadable, rebuilding: {exc}")
+            registry = {}
+    registry[role] = entry
+    with open(registry_path, "w", encoding="utf-8") as fh:
+        json.dump(registry, fh, indent=2)
+
+    print(f"[model_io] Saved '{role}' artifact -> {model_path}")
+    return model_path

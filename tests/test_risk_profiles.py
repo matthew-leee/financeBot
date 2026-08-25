@@ -143,3 +143,49 @@ def test_dynamic_breach_raises_system_exit(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         check_circuit_breaker(10_000.0 + threshold - 0.01, loss_limit=threshold)
     assert exc.value.code == 1
+
+
+# --- growth_live: sized for $10k-30k equity, evidence-gated -----------------
+
+def test_growth_live_exact_formulas(monkeypatch):
+    monkeypatch.setenv("FINANCEBOT_RISK_PROFILE", "growth_live")
+    policy = resolve_risk_policy()
+    # $10k anchor: pct binds (0.12 * 10k = 1200 < 5000 abs).
+    assert resolve_position_cap(policy, 10_000.0) == 1200.00
+    # $25k anchor: still pct-bound (3000 < 5000); loss = -min(750, 750).
+    assert resolve_position_cap(policy, 25_000.0) == 3000.00
+    assert resolve_daily_loss_threshold(policy, 25_000.0) == -750.00
+    # Abs cap binds only above ~$41.7k equity.
+    assert resolve_position_cap(policy, 1_000_000.0) == 5000.00
+    assert policy.max_gross_exposure_pct == 0.85
+    assert policy.max_open_positions == 8
+
+
+def test_growth_live_threshold_negative_for_all_equities(monkeypatch):
+    monkeypatch.setenv("FINANCEBOT_RISK_PROFILE", "growth_live")
+    policy = resolve_risk_policy()
+    for equity in (None, 0.0, -5.0, 1_000.0, 250_000.0):
+        assert resolve_daily_loss_threshold(policy, equity) < 0
+        assert resolve_position_cap(policy, equity) > 0
+
+
+def test_growth_live_overrides_may_only_tighten(monkeypatch):
+    monkeypatch.setenv("FINANCEBOT_RISK_PROFILE", "growth_live")
+    # Loosening abs cap clamps to profile ceiling with a warning.
+    monkeypatch.setenv("FINANCEBOT_MAX_POSITION_SIZE_ABS", "999999")
+    policy = resolve_risk_policy()
+    assert policy.max_position_size_abs == 5000.00
+    # Loosening position count clamps too.
+    monkeypatch.setenv("FINANCEBOT_MAX_OPEN_POSITIONS", "50")
+    policy = resolve_risk_policy()
+    assert policy.max_open_positions == 8
+    # Tightening works.
+    monkeypatch.setenv("FINANCEBOT_MAX_POSITION_SIZE_ABS", "1000")
+    policy = resolve_risk_policy()
+    assert policy.max_position_size_abs == 1000.00
+
+
+def test_all_profiles_listed_and_gated_set_matches():
+    names = set(guardrails._RISK_PROFILES)
+    assert {"research", "micro_live", "small_live", "growth_live"} <= names
+    assert guardrails._EVIDENCE_GATED_PROFILES == frozenset({"growth_live"})

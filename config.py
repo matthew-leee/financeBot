@@ -200,8 +200,48 @@ VOLATILITY_TARGET_ANNUAL: float = 0.12
 RISK_AVERSION: float = 8.0
 TURNOVER_PENALTY_BPS: float = 10.0
 
+# Core allocation objective: long-only max-Sharpe (tangency) construction with a
+# deterministic projected-gradient refinement. Falls back to the legacy
+# inverse-volatility heuristic when the tangency math degenerates.
+USE_MAX_SHARPE_CORE: bool = True
+
 # Smallest weight delta the intraday executor will bother to trade.
 MINIMUM_TRADE_WEIGHT: float = 1e-4
+
+# --- Cash-account guards (T+1 settlement reality) ---------------------------
+# On a cash account, sell proceeds are NOT reusable until settlement (T+1) and
+# paper trading never simulates this. Both knobs below are conservative by
+# default and may be tightened-only via environment overrides.
+
+# Settled-funds gate: a BUY may never commit more than withdrawable (settled)
+# cash minus unfilled buy commitments. Unknown funds fail closed (buy blocked,
+# sells/reductions always allowed).
+ENFORCE_SETTLED_CASH_GATE: bool = _env_flag("FINANCEBOT_ENFORCE_SETTLED_CASH_GATE", True)
+
+# Dollar slop for the settled-cash comparison (float noise / fee headroom).
+SETTLED_CASH_EPSILON: float = 0.01
+
+# Unfilled buy commitments older than this are pruned from the settled-cash
+# budget (DAY orders expire; GTC crypto orders must not reserve cash forever).
+PENDING_BUY_MAX_AGE_SECONDS: int = 24 * 3600
+
+# Turnover dampener for the dual executor on cash accounts: exposure-INCREASING
+# orders are scaled down and rate-limited per symbol so intraday rebalancing
+# cannot churn unsettled funds. Reductions/exits are NEVER dampened.
+CASH_ACCOUNT_TURNOVER_DAMPING: bool = _env_flag("FINANCEBOT_CASH_ACCOUNT_DAMPING", True)
+
+# Fraction of the desired increase traded per pass while damping is active.
+TURNOVER_DAMPING_FACTOR: float = 0.25
+
+# Minimum seconds between two exposure-INCREASING trades in the same symbol.
+SYMBOL_RETRADE_COOLDOWN_SECONDS: float = 900.0
+
+# --- Cost-aware execution (dual engine entries) -----------------------------
+# A buy-increase is only worth the trip when its modeled expected return
+# clears BOTH a hard floor and the estimated round-trip cost. Reductions and
+# exits are never gated -- de-risking is always free.
+MIN_TRADE_EDGE_BPS: float = 10.0
+ESTIMATED_ROUND_TRIP_COST_BPS: float = 20.0
 
 # --- Risk state machine drawdown ladder ------------------------------------
 RISK_WARN_DRAWDOWN: float = -0.03
@@ -212,3 +252,60 @@ RISK_COOLDOWN_SECONDS: int = 3600
 MAX_RECONCILIATION_QTY_DIFF: float = 1e-3
 MAX_SPREAD_BPS: float = 25.0
 MAX_DATA_STALENESS_SECONDS: int = 900
+
+# ===========================================================================
+# MACRO / PIT INGESTION ADDITIONS (additive; nothing above is renamed/removed)
+# ===========================================================================
+# These constants wire the political-economical data pipeline that feeds the
+# interday Strategist through the point-in-time feature store:
+#
+#     FRED (rates/inflation/fed funds) ─┐
+#     BLS  (labor market, optional)   ──┼─► PointInTimeRecord ─► feature store
+#     SEC EDGAR filings               ──┘      (vintage-safe available_at)
+#
+# All network access lives behind mockable connectors in src/macro.py. Tests
+# never hit these endpoints (AGENTS.md rule). Secrets, when a provider needs
+# them, are read from environment variables only -- never hardcoded.
+
+# Persisted point-in-time record file inside FEATURE_STORE_PATH.
+PIT_RECORDS_FILENAME: str = "records.jsonl"
+PIT_NEWS_FILENAME: str = "news.jsonl"
+
+# --- FRED -------------------------------------------------------------------
+# Series id -> (entity_id in the store, field, publication lag days).
+# The publication lag is the CONSERVATIVE delay between the event the value
+# describes and the moment it was publicly knowable; it becomes
+# available_at = event_time + lag so no revision/release can leak backward.
+FRED_SERIES: dict[str, tuple[str, str, float]] = {
+    # Daily treasury par yields (published same morning -> 1 day is safe).
+    "DGS3MO": ("US3M", "yield", 1.0),
+    "DGS2": ("US2Y", "yield", 1.0),
+    "DGS5": ("US5Y", "yield", 1.0),
+    "DGS10": ("US10Y", "yield", 1.0),
+    # Monthly CPI level (released mid-following-month -> ~21 days).
+    "CPIAUCSL": ("CPI", "index", 21.0),
+    # Monthly effective fed funds rate (published early next month).
+    "FEDFUNDS": ("FEDFUNDS", "rate", 14.0),
+}
+
+# Optional official API key; the keyless fredgraph CSV endpoint is used by
+# default and this key is only needed if an operator switches endpoints.
+FRED_API_KEY_ENV: str = "FRED_API_KEY"
+
+# --- BLS --------------------------------------------------------------------
+# Series id -> (entity_id, field, publication lag days). Empty by default:
+# FRED mirrors UNRATE/CES already; enable extra BLS-only series explicitly.
+BLS_SERIES: dict[str, tuple[str, str, float]] = {}
+
+BLS_API_KEY_ENV: str = "BLS_API_KEY"
+
+# --- SEC EDGAR --------------------------------------------------------------
+SEC_USER_AGENT_EMAIL_ENV: str = "SEC_CONTACT_EMAIL"
+# Filings are accepted mostly after US close; only consider them knowable the
+# next trading morning (conservative UTC timestamp) to avoid intraday leaks.
+SEC_FILING_AVAILABLE_LAG_DAYS: float = 0.75
+
+# --- Macro regime thresholds (deterministic classifier in the strategist) ---
+REGIME_CPI_YOY_SHOCK_LEVEL: float = 0.04
+REGIME_CPI_YOY_RISE_3M: float = 0.002
+REGIME_INVERTED_CURVE_SLOPE: float = 0.0

@@ -355,6 +355,192 @@ class PointInTimeFeatureStore:
         """
         return not self._by_key and not self._news
 
+    def latest_available_at(self) -> datetime | None:
+        """Newest available_at among stored records and news (telemetry hook).
+
+        The tactical executor probes this name to compute data staleness for
+        the risk state machine. Returns None when the store is empty.
+        """
+        candidates: list[datetime] = [rec.available_at for rec in self._by_key.values()]
+        candidates.extend(ev.available_at for ev in self._news.values())
+        return max(candidates) if candidates else None
+
+    # -- persistence ---------------------------------------------------------
+
+    @property
+    def records_path(self) -> str:
+        """Absolute path of the persisted record file."""
+        import os as _os
+
+        return _os.path.join(self.storage_path, config.PIT_RECORDS_FILENAME)
+
+    @property
+    def news_path(self) -> str:
+        """Absolute path of the persisted news file."""
+        import os as _os
+
+        return _os.path.join(self.storage_path, config.PIT_NEWS_FILENAME)
+
+    def save_to_disk(self) -> int:
+        """
+        Persist all records + news to JSONL under storage_path (atomic replace).
+
+        Returns the number of records written. Failures are logged, never
+        raised: persistence problems must not kill a research or live process.
+        """
+        import json as _json
+        import os as _os
+        import tempfile
+
+        written = 0
+        try:
+            _os.makedirs(self.storage_path, exist_ok=True)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=self.storage_path, suffix=".tmp", prefix="records_"
+            )
+            try:
+                with _os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                    for rec in self._by_key.values():
+                        fh.write(
+                            _json.dumps(
+                                {
+                                    "event_time": rec.event_time.isoformat(),
+                                    "available_at": rec.available_at.isoformat(),
+                                    "source": rec.source,
+                                    "entity_id": rec.entity_id,
+                                    "field": rec.field,
+                                    "value": rec.value,
+                                    "revision_id": rec.revision_id,
+                                    "confidence": rec.confidence,
+                                }
+                            )
+                            + "\n"
+                        )
+                        written += 1
+                _os.replace(tmp_path, self.records_path)
+            except Exception:
+                if _os.path.exists(tmp_path):
+                    _os.unlink(tmp_path)
+                raise
+        except Exception as exc:  # noqa: BLE001 -- persistence must not crash run
+            print(f"[pit] Failed to persist records: {exc}")
+            return 0
+
+        # News is optional cargo; a failure here must not undo record writes.
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=self.storage_path, suffix=".tmp", prefix="news_"
+            )
+            try:
+                with _os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                    for ev in self._news.values():
+                        fh.write(
+                            _json.dumps(
+                                {
+                                    "event_id": ev.event_id,
+                                    "event_time": ev.event_time.isoformat(),
+                                    "available_at": ev.available_at.isoformat(),
+                                    "source": ev.source,
+                                    "text_hash": ev.text_hash,
+                                    "tickers": list(ev.tickers),
+                                    "themes": list(ev.themes),
+                                    "embedding": [
+                                        float(x) for x in np.asarray(ev.embedding).ravel()
+                                    ],
+                                    "source_weight": ev.source_weight,
+                                    "event_weight": ev.event_weight,
+                                }
+                            )
+                            + "\n"
+                        )
+                _os.replace(tmp_path, self.news_path)
+            except Exception:
+                if _os.path.exists(tmp_path):
+                    _os.unlink(tmp_path)
+                raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"[pit] Failed to persist news events: {exc}")
+
+        return written
+
+    def load_from_disk(self) -> int:
+        """
+        Load persisted records + news from storage_path into memory.
+
+        Replaces current in-memory state with what is on disk. A corrupt or
+        missing file fails closed (empty store + warning), never partially
+        loaded state. Returns the number of records loaded.
+        """
+        import json as _json
+        import os as _os
+
+        loaded = 0
+        records: dict[tuple, PointInTimeRecord] = {}
+        path = self.records_path
+        if _os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        raw = _json.loads(line)
+                        rec = PointInTimeRecord(
+                            event_time=datetime.fromisoformat(raw["event_time"]),
+                            available_at=datetime.fromisoformat(raw["available_at"]),
+                            source=str(raw["source"]),
+                            entity_id=str(raw["entity_id"]),
+                            field=str(raw["field"]),
+                            value=raw["value"],
+                            revision_id=raw.get("revision_id"),
+                            confidence=float(raw.get("confidence", 1.0)),
+                        )
+                        key = (
+                            rec.source,
+                            rec.entity_id,
+                            rec.field,
+                            rec.event_time,
+                            rec.revision_id,
+                        )
+                        records[key] = rec
+                        loaded += 1
+            except Exception as exc:  # noqa: BLE001 -- corrupt file -> fail closed
+                print(f"[pit] Discarding corrupt record file {path}: {exc}")
+                return 0
+
+        news: dict[str, NewsEvent] = {}
+        npath = self.news_path
+        if _os.path.exists(npath):
+            try:
+                with open(npath, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        raw = _json.loads(line)
+                        ev = NewsEvent(
+                            event_id=str(raw["event_id"]),
+                            event_time=datetime.fromisoformat(raw["event_time"]),
+                            available_at=datetime.fromisoformat(raw["available_at"]),
+                            source=str(raw["source"]),
+                            text_hash=str(raw["text_hash"]),
+                            tickers=tuple(raw.get("tickers", ())),
+                            themes=tuple(raw.get("themes", ())),
+                            embedding=np.asarray(
+                                raw.get("embedding", []), dtype="float64"
+                            ),
+                            source_weight=float(raw.get("source_weight", 1.0)),
+                            event_weight=float(raw.get("event_weight", 1.0)),
+                        )
+                        news[ev.event_id] = ev
+            except Exception as exc:  # noqa: BLE001
+                print(f"[pit] Discarding corrupt news file {npath}: {exc}")
+                news = {}
+
+        self._by_key = records
+        self._news = news
+        return loaded
+
     # -- ingestion -----------------------------------------------------------
 
     def upsert_records(self, records: Iterable[PointInTimeRecord]) -> int:
@@ -539,6 +725,34 @@ class PointInTimeFeatureStore:
             if y10 is not None and y2 is not None and y5 is not None:
                 feats["curve_curvature"] = 2.0 * y5 - y2 - y10
 
+            # Political-economical state: inflation, labor, policy rate.
+            # All series are vintage-gated by _series (available_at <= as_of).
+            cpi_index = self._series(
+                entity_id="CPI", field="index", as_of=as_of_utc, lookback=None
+            ).dropna()
+            cpi_yoy = _yoy_percent(cpi_index, 12)
+            if cpi_yoy is not None:
+                feats["cpi_yoy"] = cpi_yoy
+            if len(cpi_index) >= 16:
+                yoy_now = _yoy_percent(cpi_index, 12, end=-1)
+                yoy_prev = _yoy_percent(cpi_index.iloc[:-3], 12, end=-1)
+                if yoy_now is not None and yoy_prev is not None:
+                    feats["cpi_yoy_chg_3m"] = yoy_now - yoy_prev
+            unrate = self._series(
+                entity_id="UNEMPLOYMENT", field="rate", as_of=as_of_utc, lookback=None
+            ).dropna()
+            if not unrate.empty:
+                feats["unemployment"] = float(unrate.iloc[-1])
+                if len(unrate) >= 4:
+                    feats["unemployment_chg_3m"] = (
+                        float(unrate.iloc[-1]) - float(unrate.iloc[-4])
+                    )
+            fed_funds = self._latest_value(
+                symbol="FEDFUNDS", field="rate", as_of=as_of_utc
+            )
+            if fed_funds is not None:
+                feats["fed_funds_rate"] = fed_funds
+
             # SEC filing age (days since latest filing available as of as_of).
             filing_age = self._filing_age_days(symbol=symbol, as_of=as_of_utc)
             if filing_age is not None:
@@ -668,11 +882,71 @@ class PointInTimeFeatureStore:
             return pd.DataFrame()
         return pd.DataFrame(cols).sort_index()
 
+    def close_panel(
+        self,
+        *,
+        universe: Iterable[str],
+        end: datetime,
+        lookback_days: int = 400,
+    ) -> pd.DataFrame:
+        """
+        Long-form point-in-time daily closes (timestamp, symbol, close).
+
+        This is the label-building input: every row respects
+        available_at <= end so training labels can never see revised prices.
+        """
+        rows: list[pd.DataFrame] = []
+        for symbol in universe:
+            close = self._series(
+                entity_id=symbol,
+                field="close",
+                as_of=_to_utc(end),
+                lookback=timedelta(days=int(lookback_days)),
+            ).dropna()
+            if close.empty:
+                continue
+            rows.append(
+                pd.DataFrame(
+                    {
+                        "timestamp": close.index,
+                        "symbol": symbol,
+                        "close": close.to_numpy(dtype="float64"),
+                    }
+                )
+            )
+        if not rows:
+            return pd.DataFrame(columns=["timestamp", "symbol", "close"])
+        out = pd.concat(rows, ignore_index=True)
+        return out.sort_values(["symbol", "timestamp"], kind="mergesort")
+
 
 def _horizon_return(close: pd.Series, horizon: int) -> float:
     if len(close) <= horizon:
         return float("nan")
     return float(close.iloc[-1] / close.iloc[-1 - horizon] - 1.0)
+
+
+def _yoy_percent(
+    series: pd.Series, periods: int, *, end: int = -1
+) -> float | None:
+    """Year-over-year percent change ending at position `end` (PIT-safe).
+
+    Returns None when insufficient history exists so callers can omit the
+    feature instead of fabricating a value.
+    """
+    if series.empty:
+        return None
+    n = len(series)
+    end_idx = end % n if n else 0
+    if end_idx < 0:
+        end_idx += n
+    if end_idx < periods or n <= periods:
+        return None
+    now = float(series.iloc[end_idx])
+    past = float(series.iloc[end_idx - periods])
+    if past == 0.0 or not np.isfinite(now) or not np.isfinite(past):
+        return None
+    return now / past - 1.0
 
 
 def _annualized_vol(

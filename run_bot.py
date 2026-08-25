@@ -36,17 +36,30 @@ def run_dual() -> None:
 
     feature_store = PointInTimeFeatureStore(config.FEATURE_STORE_PATH)
 
-    # Fail closed BEFORE constructing a broker or an order loop: the dual engine
-    # has no production persisted feature loader yet, so an empty feature store
-    # can only emit empty allocations. Refuse to run rather than trade on nothing.
+    # Hydrate the persisted point-in-time state produced by
+    # build_feature_store.py / research ingestion. A missing or corrupt file
+    # fails closed: the store stays empty and the gate below aborts.
+    loader = getattr(feature_store, "load_from_disk", None)
+    loaded_records = 0
+    if callable(loader):
+        try:
+            loaded_records = int(loader() or 0)
+        except Exception as exc:  # noqa: BLE001 -- never boot on a broken store
+            print(f"[startup] Feature store load failed: {exc}")
+            loaded_records = 0
+
+    # Fail closed BEFORE constructing a broker or an order loop: an empty feature
+    # store can only emit empty allocations. Refuse to run rather than trade on
+    # nothing.
     if feature_store.is_empty():
         print(
             "[startup] ABORT -- dual execution requires a populated persisted "
-            "point-in-time feature store, but it is empty. Dual VPS execution is "
-            "not deployment-ready; run with FINANCEBOT_ENGINE=legacy. A future "
-            "change will add persisted dual feature loading."
+            "point-in-time feature store, but it is empty. Run "
+            "`python build_feature_store.py` first (then `python train_dual.py`), "
+            "or run with FINANCEBOT_ENGINE=legacy."
         )
         raise SystemExit(1)
+    print(f"[startup] Dual engine: {loaded_records} PIT records loaded.")
 
     broker = Broker()
     model_registry = ModelRegistry(config.MODEL_REGISTRY_DIR)
@@ -69,6 +82,30 @@ def run_dual() -> None:
     executor.run_forever()
 
 
+def _gate_legacy_profile() -> None:
+    """
+    Startup gate: promotion-gated risk profiles must show earned evidence.
+
+    Resolves the immutable policy (also validating all env overrides) and, for
+    evidence-gated profiles like growth_live, verifies the operator-local
+    trade logs prove a qualifying track record BEFORE any broker is built.
+    Fails closed with SystemExit(1) -- identical philosophy to the dual
+    engine's empty-store gate.
+    """
+    from src.guardrails import (
+        PromotionEvidenceError,
+        resolve_risk_policy,
+        verify_promotion_evidence,
+    )
+
+    policy = resolve_risk_policy()
+    try:
+        verify_promotion_evidence(policy.profile)
+    except PromotionEvidenceError as exc:
+        print(f"[startup] ABORT -- {exc}")
+        raise SystemExit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="financeBot live entrypoint")
     parser.add_argument(
@@ -82,6 +119,7 @@ def main() -> None:
     if args.engine == "dual":
         run_dual()
     else:
+        _gate_legacy_profile()
         run_legacy()
 
 

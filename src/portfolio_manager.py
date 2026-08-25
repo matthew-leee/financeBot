@@ -22,7 +22,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import config
@@ -158,6 +158,10 @@ class PortfolioManager:
         self.realized_pnl: float = 0.0
         # order_id -> arrival/reference price for slippage attribution.
         self._order_ref_price: dict[str, float] = {}
+        # id -> {"notional": float, "ts": iso} for UNFILLED buy commitments.
+        # Settled-cash accounting subtracts these so two buys in one pass can
+        # not both claim the same dollars. Keyed by client AND broker ids.
+        self._pending_buy_notional: dict[str, dict] = {}
         self._load_state()
 
     # -- order submission ----------------------------------------------------
@@ -180,12 +184,48 @@ class PortfolioManager:
                 return None
 
         client_order_id = str(uuid.uuid4())
+
+        # T+1 settled-funds gate (cash accounts): a BUY may never commit more
+        # than withdrawable (settled) cash minus unfilled buy commitments.
+        # Sells/reductions are always exempt -- de-risking is never blocked.
+        if side == "buy" and config.ENFORCE_SETTLED_CASH_GATE:
+            ok, available = self._settled_cash_allows(quantity, intent)
+            if not ok:
+                avail_txt = f"{available:.2f}" if available is not None else "UNKNOWN"
+                print(
+                    f"[pm] BLOCKED buy {quantity} {symbol}: exceeds settled cash "
+                    f"(available={avail_txt})."
+                )
+                self._append_row(
+                    self.orders_log_path,
+                    ORDERS_LOG_COLUMNS,
+                    {
+                        "submitted_at": _to_utc(None).isoformat(),
+                        "client_order_id": client_order_id,
+                        "broker_order_id": "",
+                        "symbol": symbol,
+                        "side": side,
+                        "requested_qty": round(quantity, 6),
+                        "order_type": _get(intent, "order_style", "market"),
+                        "limit_price": _get(intent, "limit_price")
+                        if _get(intent, "limit_price") is not None
+                        else "",
+                        "reduce_only": reduce_only,
+                        "reason": _get(intent, "reason", ""),
+                        "status": "blocked_settled_cash",
+                    },
+                )
+                return None
+
         order_style = _get(intent, "order_style", "market")
         limit_price = _get(intent, "limit_price")
         reason = _get(intent, "reason", "")
 
         broker_order_id = self._broker_submit(intent, client_order_id)
         status = "submitted" if broker_order_id else "rejected"
+
+        if broker_order_id and side == "buy" and not reduce_only:
+            self._record_pending_buy(client_order_id, broker_order_id, quantity, intent)
 
         # Remember the reference price for later slippage math.
         ref_price = limit_price if limit_price else self._reference_price(symbol)
@@ -213,6 +253,124 @@ class PortfolioManager:
         self._save_state()
         return broker_order_id
 
+    # -- settled-funds accounting (T+1 cash accounts) ------------------------
+
+    def _withdrawable_cash(self) -> float | None:
+        """Withdrawable/settled cash from the broker, or None when unknown."""
+        for name in ("get_withdrawable_cash", "get_cash"):
+            fn = getattr(self.broker, name, None)
+            if not callable(fn):
+                continue
+            try:
+                val = fn()
+                if val is None:
+                    continue  # source present but empty -> try the next one
+                return float(val)
+            except Exception:  # noqa: BLE001 -- fall through to next source
+                continue
+        return None
+
+    def _settled_cash_allows(self, quantity: float, intent: object) -> tuple[bool, float | None]:
+        """
+        True when this BUY fits inside settled cash minus pending commitments.
+
+        Notional uses the limit price when present; otherwise the last known
+        reference price; otherwise the hard MAX_POSITION_SIZE cap as a worst
+        case. Unknown funds fail closed (buy blocked, sells unaffected).
+        """
+        symbol = _get(intent, "symbol")
+        limit_price = _get(intent, "limit_price")
+        price: float | None = None
+        if limit_price is not None:
+            try:
+                p = float(limit_price)
+                price = p if p > 0 else None
+            except (TypeError, ValueError):
+                price = None
+        if price is None:
+            price = self._reference_price(symbol)
+        if price:
+            notional = quantity * price
+        else:
+            # No trusted price -> assume the worst legal clip so an unknown
+            # price can never sneak past the gate.
+            notional = config.MAX_POSITION_SIZE
+
+        available = self._withdrawable_cash()
+        if available is None:
+            return False, None  # fail closed
+
+        self._prune_pending_buys()
+        pending = sum(
+            float(entry.get("notional", 0.0)) for entry in self._pending_buy_notional.values()
+        )
+        return (notional <= available - pending + config.SETTLED_CASH_EPSILON), available
+
+    def _record_pending_buy(
+        self, client_order_id: str, broker_order_id: str, quantity: float, intent: object
+    ) -> None:
+        """Commit this buy's notional against settled cash until it fills."""
+        symbol = _get(intent, "symbol")
+        limit_price = _get(intent, "limit_price")
+        price = None
+        if limit_price is not None:
+            try:
+                p = float(limit_price)
+                price = p if p > 0 else None
+            except (TypeError, ValueError):
+                price = None
+        if price is None:
+            price = self._reference_price(symbol)
+        notional = quantity * price if price else config.MAX_POSITION_SIZE
+
+        entry = {
+            "notional": round(float(notional), 6),
+            "ts": _to_utc(None).isoformat(),
+            "symbol": symbol,
+        }
+        self._pending_buy_notional[str(client_order_id)] = dict(entry)
+        if broker_order_id:
+            self._pending_buy_notional[str(broker_order_id)] = dict(entry)
+
+    def _release_pending_buy(self, order_id: str) -> None:
+        """
+        Release the commitment behind `order_id`.
+
+        Entries are mirrored under BOTH the client and broker order ids, so
+        releasing one key sweeps every entry sharing its exact commitment
+        signature -- otherwise the ghost mirror keeps reserving settled cash.
+        """
+        entry = self._pending_buy_notional.pop(str(order_id), None)
+        if entry is None:
+            return
+        sig = (entry.get("symbol"), entry.get("notional"), entry.get("ts"))
+        for key in list(self._pending_buy_notional.keys()):
+            other = self._pending_buy_notional[key]
+            if (other.get("symbol"), other.get("notional"), other.get("ts")) == sig:
+                del self._pending_buy_notional[key]
+
+    def _prune_pending_buys(self) -> int:
+        """
+        Drop stale commitments (unparseable or older than the max age).
+
+        NOTE: mirrored entries (same commitment under client AND broker id)
+        are intentional and must survive this prune -- _release_pending_buy
+        needs whichever id the fill reports.
+        """
+        now = _to_utc(None)
+        max_age = timedelta(seconds=int(config.PENDING_BUY_MAX_AGE_SECONDS))
+        stale = []
+        for key, entry in self._pending_buy_notional.items():
+            try:
+                ts = datetime.fromisoformat(str(entry.get("ts")))
+                if _to_utc(ts) < now - max_age:
+                    stale.append(key)
+            except (TypeError, ValueError):
+                stale.append(key)  # unparseable -> treat as stale
+        for key in stale:
+            del self._pending_buy_notional[key]
+        return len(stale)
+
     # -- fill processing -----------------------------------------------------
 
     def poll_and_apply_fills(self) -> list[BrokerFill]:
@@ -230,6 +388,9 @@ class PortfolioManager:
                 continue  # idempotency: never double-count a replayed fill
             self.apply_fill(fill)
             self.processed_fill_ids.add(fill.fill_id)
+            # A filled buy no longer pends against settled cash.
+            if fill.side == "buy":
+                self._release_pending_buy(fill.order_id)
             applied.append(fill)
 
         if applied:
@@ -515,6 +676,9 @@ class PortfolioManager:
             self._order_ref_price = {
                 k: float(v) for k, v in data.get("order_ref_price", {}).items()
             }
+            self._pending_buy_notional = {
+                str(k): dict(v) for k, v in data.get("pending_buy_notional", {}).items()
+            }
             if "fifo" in data:
                 self.fifo = FIFOInventory.from_dict(data["fifo"])
         except Exception:  # noqa: BLE001 -- corrupt state -> start conservative
@@ -531,6 +695,7 @@ class PortfolioManager:
                         "processed_fill_ids": sorted(self.processed_fill_ids),
                         "realized_pnl": self.realized_pnl,
                         "order_ref_price": self._order_ref_price,
+                        "pending_buy_notional": self._pending_buy_notional,
                         "fifo": self.fifo.to_dict(),
                     },
                     fh,

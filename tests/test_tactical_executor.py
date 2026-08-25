@@ -62,7 +62,9 @@ def _alloc(rows: dict[str, TargetAllocation]) -> AllocationMatrix:
     )
 
 
-def _target(symbol, w) -> TargetAllocation:
+def _target(symbol, w, *, expected_return: float | None = 0.05) -> TargetAllocation:
+    # Healthy default edge (500bps) so entry-path tests exercise sizing/caps,
+    # not the cost-aware gate -- which gets its own dedicated tests below.
     band = max(abs(w) * 0.25, 0.005)
     return TargetAllocation(
         symbol=symbol,
@@ -72,6 +74,7 @@ def _target(symbol, w) -> TargetAllocation:
         direction_bias="long" if w > 0 else "flat",
         volatility_ceiling=0.12,
         rebalance_priority=abs(w),
+        expected_return=expected_return,
     )
 
 
@@ -245,3 +248,79 @@ def test_run_once_reduces_risk_from_live_drawdown_metrics(tmp_path, mock_broker)
     assert submitted and submitted[0].side == "sell"
     assert submitted[0].reduce_only is True
     assert risk.state == RiskState.REDUCE_RISK
+
+
+# --- cost-aware entry gate (MIN_TRADE_EDGE_BPS / ESTIMATED_ROUND_TRIP_COST_BPS)
+
+def test_entry_blocked_below_required_edge(tmp_path, mock_broker) -> None:
+    # 5bps modeled edge < required max(MIN_TRADE_EDGE_BPS, COST_BPS) = 20bps.
+    matrix = _alloc({"AAA": _target("AAA", 0.1, expected_return=0.0005)})
+    mock_broker.equity = 1000.0
+    mock_broker.set_positions([])
+    executor, _, _ = _executor(tmp_path, mock_broker, matrix, {"AAA": 100.0})
+    decision = executor.risk_machine.permissions_for_state(RiskState.NORMAL)
+    intent = executor.process_symbol(
+        symbol="AAA", allocation=matrix, risk_decision=decision, now=NOW
+    )
+    assert intent is None
+
+
+def test_entry_allowed_when_edge_clears_cost(tmp_path, mock_broker) -> None:
+    matrix = _alloc({"AAA": _target("AAA", 0.1, expected_return=0.01)})  # 100bps
+    mock_broker.equity = 1000.0
+    mock_broker.set_positions([])
+    executor, pm, _ = _executor(tmp_path, mock_broker, matrix, {"AAA": 100.0})
+    decision = executor.risk_machine.permissions_for_state(RiskState.NORMAL)
+    intent = executor.process_symbol(
+        symbol="AAA", allocation=matrix, risk_decision=decision, now=NOW
+    )
+    assert intent is not None
+    assert intent.side == "buy"
+
+
+def test_entry_fails_closed_without_edge_estimate(tmp_path, mock_broker) -> None:
+    matrix = _alloc({"AAA": _target("AAA", 0.1, expected_return=None)})
+    mock_broker.equity = 1000.0
+    mock_broker.set_positions([])
+    executor, _, _ = _executor(tmp_path, mock_broker, matrix, {"AAA": 100.0})
+    decision = executor.risk_machine.permissions_for_state(RiskState.NORMAL)
+    intent = executor.process_symbol(
+        symbol="AAA", allocation=matrix, risk_decision=decision, now=NOW
+    )
+    assert intent is None
+
+
+def test_nan_edge_estimate_fails_closed(tmp_path, mock_broker) -> None:
+    import math
+
+    matrix = _alloc({"AAA": _target("AAA", 0.1, expected_return=float("nan"))})
+    assert math.isnan(matrix.get("AAA").expected_return)
+    mock_broker.equity = 1000.0
+    mock_broker.set_positions([])
+    executor, _, _ = _executor(tmp_path, mock_broker, matrix, {"AAA": 100.0})
+    decision = executor.risk_machine.permissions_for_state(RiskState.NORMAL)
+    assert (
+        executor.process_symbol(
+            symbol="AAA", allocation=matrix, risk_decision=decision, now=NOW
+        )
+        is None
+    )
+
+
+def test_reduction_exempt_from_edge_gate(tmp_path, mock_broker) -> None:
+    from tests.conftest import FakeBrokerPosition
+
+    # Held AAA must be reducible even with NO edge estimate on its zero target.
+    matrix = _alloc({"AAA": _target("AAA", 0.0, expected_return=None)})
+    mock_broker.equity = 1000.0
+    mock_broker.set_positions(
+        [FakeBrokerPosition(symbol="AAA", qty=1.0, market_value=100.0, avg_entry_price=100.0)]
+    )
+    executor, pm, _ = _executor(tmp_path, mock_broker, matrix, {"AAA": 100.0})
+    decision = executor.risk_machine.permissions_for_state(RiskState.NORMAL)
+    intent = executor.process_symbol(
+        symbol="AAA", allocation=matrix, risk_decision=decision, now=NOW
+    )
+    assert intent is not None
+    assert intent.side == "sell"
+    assert intent.reduce_only is True
