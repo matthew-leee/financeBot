@@ -25,6 +25,9 @@
 Description=financeBot algo trading loop (alpaca paper)
 After=network-online.target time-sync.target
 Wants=network-online.target time-sync.target
+# Rate-limit restart storms (must live in [Unit], not [Service]).
+StartLimitIntervalSec=1800
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -32,11 +35,11 @@ User=financebot
 Group=financebot
 WorkingDirectory=/opt/financebot
 EnvironmentFile=/etc/financebot.env
+# journald gets telemetry live, not after 8KB of stdout buffering.
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/financebot/.venv/bin/python /opt/financebot/run_bot.py
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=1800
-StartLimitBurst=5
 
 # Hardening: keep blast radius small.
 MemoryMax=2G
