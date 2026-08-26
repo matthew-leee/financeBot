@@ -22,3 +22,13 @@
 - **Mocking External APIs:** Absolutely FORBIDDEN to hit real Alpaca live or paper endpoints during tests. Use `unittest.mock` to mock all `alpaca-py` market data fetches and order placements.
 - **Deterministic Validation:** Write edge-case tests ensuring that inputs exceeding guardrails (e.g., trying to trade $10 when MAX_POSITION_SIZE = 5.00) strictly fail or clamp correctly.
 - **Self-Documentation:** Every time you add a new feature, modify file structures, or change configuration variables, you must immediately update the main `README.md` to accurately reflect these changes. Keep the architecture diagram/list pristine and completely up to date.
+
+## Version Control & Documentation Discipline (MANDATORY)
+Every code change, without exception, is complete only when ALL of the following are done in the same working session:
+1. **Tests first:** run the full suite (`python -m pytest -q`) and get it green before declaring anything done. Never claim completion on an untested change.
+2. **Version control:** stage and commit the change to git with a descriptive conventional-style message (what + why). Push to `master` — pushes to master are pre-authorized standing workflow for this repo.
+3. **Changelog:** add an entry under `CHANGELOG.md` → `[Unreleased]` using Keep-a-Changelog categories (`Added` / `Changed` / `Fixed` / `Removed`). One line per user-visible behavior change; internal-only refactors still warrant a line.
+4. **README updates:** update BOTH `README.md` (technical accuracy: modules, config/env vars, schemas, architecture lists) AND `README_SIMPLE.md` when behavior is user-visible (plain-language explanation).
+5. **No orphan changes:** never leave a working tree dirty at session end, and never describe work as "done" if any of steps 1–4 is missing.
+
+This file is read automatically by coding agents (opencode, codex, etc.) at session start — agents must honor this section exactly as written.

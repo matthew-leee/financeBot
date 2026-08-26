@@ -241,6 +241,20 @@ submission with `client_order_id`, open-order counts, kill-switch cancels,
 and API health/error-rate telemetry. Legacy `src/trade_log.py` remains a
 shim for existing tests and the dashboard.
 
+### Fractionability & market-hours guards
+
+Two execution-path guards close real-money gaps observed in paper soak:
+
+- **Non-fractionable assets** (`broker.is_fractionable()`, cached per process):
+  several inverse ETFs reject fractional quantities outright (Alpaca
+  40310000). For such assets `_hardened_buy` sizes in WHOLE shares within the
+  position cap, and skips cleanly (`non_fractionable_too_expensive`) when even
+  one share exceeds it. Unknown fractionability falls back to legacy sizing.
+- **Closed-market hedge deferral** (`hedge_market_closed`): an Active Pivot to
+  an equity-ETF hedge while the equity market is closed would queue a fill at
+  stale reference prices. Such pivots are now deferred to the first post-open
+  pass instead. Crypto-target processing itself remains 24/7.
+
 ### Daily sentiment pipeline (Gemini via OpenRouter)
 
 `generate_sentiment.py` is the morning helper behind `daily_sentiment.json`.

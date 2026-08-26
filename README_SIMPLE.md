@@ -10,6 +10,13 @@ that card all day. If the helper oversleeps, the robot doesn't panic -- no
 feeling written just means "play normally," but a genuinely bad feeling still
 makes it buy umbrellas instead.
 
+Two more tiny store rules the robot obeys:
+
+- Some candies sell only in WHOLE pieces. If one piece costs more than the
+  allowance, the robot skips that candy instead of begging.
+- If the umbrella shop is closed, the robot WAITS for it to open. No leaving
+  notes to buy an umbrella at yesterday's price.
+
 ---
 
 ## The one-sentence version
