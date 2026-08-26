@@ -30,11 +30,15 @@ def test_get_score_crypto_falls_back_to_base_asset() -> None:
     assert get_score(report, "BTC/USD") == 8.0
 
 
-def test_is_trade_allowed_threshold_and_fail_closed() -> None:
+def test_is_trade_allowed_threshold_and_fail_closed(monkeypatch) -> None:
     report = {"SPY": {"score": 5.0}, "AAPL": {"score": 4.99}}
     assert is_trade_allowed(report, "SPY", min_score=5.0) is True
     assert is_trade_allowed(report, "AAPL", min_score=5.0) is False
-    # Missing symbol must fail CLOSED (blocked), never open.
+    # Default semantics: missing symbol is NEUTRAL-PASS (config default True).
+    monkeypatch.setattr(config, "SENTIMENT_MISSING_IS_PASS", True)
+    assert is_trade_allowed(report, "MSFT", min_score=5.0) is True
+    # Legacy fail-closed behavior remains available via the flag.
+    monkeypatch.setattr(config, "SENTIMENT_MISSING_IS_PASS", False)
     assert is_trade_allowed(report, "MSFT", min_score=5.0) is False
 
 
@@ -114,3 +118,26 @@ def test_select_hedge_asset_none_when_target_missing() -> None:
     from src.sentiment import select_hedge_asset
 
     assert select_hedge_asset("AAPL", bar_fetcher=lambda s, lookback_days: pd.DataFrame()) is None
+
+
+# --- missing-score semantics (neutral-pass) ---------------------------------
+
+def test_missing_score_neutral_pass_when_enabled(monkeypatch):
+    monkeypatch.setattr(config, "SENTIMENT_MISSING_IS_PASS", True)
+    # Symbol absent from the report entirely.
+    assert is_trade_allowed({"SPY": {"score": 8.0}}, "NVDA") is True
+    # Entry present but score invalid/unparseable -> also "missing".
+    assert is_trade_allowed({"BAD": {"score": "n/a"}}, "BAD") is True
+    # Crypto base-asset fallback still applies before absence is judged.
+    assert is_trade_allowed({"BTC": {"score": 9.0}}, "BTC/USD") is True
+
+
+def test_missing_score_stays_weak_when_disabled(monkeypatch):
+    monkeypatch.setattr(config, "SENTIMENT_MISSING_IS_PASS", False)
+    assert is_trade_allowed({}, "NVDA") is False
+
+
+def test_explicit_low_score_blocks_even_in_neutral_pass(monkeypatch):
+    monkeypatch.setattr(config, "SENTIMENT_MISSING_IS_PASS", True)
+    # Only ABSENCE is neutral; bad news is never silently upgraded.
+    assert is_trade_allowed({"AAPL": {"score": 2.0}}, "AAPL") is False

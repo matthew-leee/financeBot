@@ -1,0 +1,16 @@
+[Unit]
+Description=financeBot daily sentiment generator (Gemini via OpenRouter)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=financebot
+Group=financebot
+WorkingDirectory=/opt/financebot
+EnvironmentFile=/etc/financebot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/financebot/.venv/bin/python /opt/financebot/generate_sentiment.py
+# Fail-closed: a failed run leaves yesterday's report in place; the trading
+# loop's neutral-pass semantics govern symbols missing from it.
+Nice=5

@@ -113,6 +113,23 @@ BACKTEST_RESULTS_PATH: str = "backtest_results.csv"
 # the XGBoost signal is strong, because this layer is a strict risk gate.
 SENTIMENT_MIN_SCORE: float = 5.0
 
+# Missing/invalid sentiment semantics: True = treat as NEUTRAL-PASS (trade the
+# target normally), False = legacy weak-sentiment behavior (pivot to hedge).
+# Neutral-pass lets a paper soak accumulate direct-buy statistics even when the
+# daily report only covers part of the universe.
+SENTIMENT_MISSING_IS_PASS: bool = _env_flag("FINANCEBOT_SENTIMENT_MISSING_IS_PASS", True)
+
+# --- LLM morning helper (daily_sentiment.json generator) ---------------------
+# OpenAI-compatible chat-completions endpoint; defaults target OpenRouter's
+# Gemini 3.7 Flash. The API key itself comes from the environment variable
+# named below (never hardcoded). Override model/base via env without edits.
+LLM_BASE_URL: str = os.environ.get(
+    "FINANCEBOT_LLM_BASE_URL", "https://openrouter.ai/api/v1"
+).rstrip("/")
+LLM_MODEL: str = os.environ.get("FINANCEBOT_LLM_MODEL", "google/gemini-3.7-flash")
+LLM_API_KEY_ENV: str = os.environ.get("FINANCEBOT_LLM_API_KEY_ENV", "OPENAI_API_KEY")
+LLM_TIMEOUT_SECONDS: float = 90.0
+
 # ---------------------------------------------------------------------------
 # ACTIVE PIVOT / DYNAMIC CORRELATION HEDGING
 # ---------------------------------------------------------------------------

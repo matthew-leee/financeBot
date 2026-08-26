@@ -390,7 +390,31 @@ def _hardened_buy(broker, ticker, price, pass_ctx) -> None:
         return
 
     cap = resolve_position_cap(pass_ctx.policy, pass_ctx.ledger.equity)
-    qty = clamp_position_size(cap, price, max_notional=cap)
+
+    # Fractionability pre-check: some inverse ETFs reject fractional quantities
+    # outright (Alpaca 40310000). Size in WHOLE shares for those, and skip when
+    # even one share exceeds the cap. Unknown -> legacy fractional sizing.
+    frac_fn = getattr(broker, "is_fractionable", None)
+    fractionable = None
+    if callable(frac_fn):
+        try:
+            fractionable = frac_fn(ticker)
+        except Exception:  # noqa: BLE001 -- unknown stays unknown
+            fractionable = None
+
+    if fractionable is False:
+        qty = float(int(cap // price)) if price > 0 else 0.0
+        if qty < 1:
+            telem.skip("non_fractionable_too_expensive")
+            print(
+                f"[loop] {ticker}: non-fractionable and 1 share "
+                f"({price:.2f}) exceeds cap ({cap:.2f}); skipping buy."
+            )
+            return
+        print(f"[loop] {ticker}: non-fractionable -> whole-share sizing ({qty:.0f} sh).")
+    else:
+        qty = clamp_position_size(cap, price, max_notional=cap)
+
     order_notional = qty * price
     ok, reason = pass_ctx.ledger.check_buy(ticker, order_notional, price)
     if not ok:
@@ -412,6 +436,19 @@ def _hardened_pivot(symbol, broker, pass_ctx) -> None:
         telem.skip("no_hedge")
         print(f"[loop] {symbol}: no hedge available, declining trade.")
         return
+
+    # Closed-shop guard: an equity-ETF hedge cannot fill cleanly while the
+    # equity market is closed (queued fills execute at stale reference prices).
+    # Defer the whole pivot to a post-open pass. Crypto-target processing is
+    # allowed around the clock, but its EQUITY hedge is not.
+    if "/" not in hedge and pass_ctx.market_open is not True:
+        telem.skip("hedge_market_closed")
+        print(
+            f"[loop] {symbol}: hedge {hedge} trades on the closed equity "
+            f"market; deferring pivot until open."
+        )
+        return
+
     hedge_bars = pass_ctx.get_bars(hedge, lookback_days=config.HEDGE_CORR_LOOKBACK_DAYS)
     if hedge_bars is None or hedge_bars.empty:
         telem.skip("no_hedge_price")

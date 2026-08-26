@@ -4,6 +4,12 @@ This is the "no scary words" version of the README. If you want every detail,
 go read `README.md`. If you want to understand what this robot *does*, read
 this.
 
+Every morning (before the stock store opens), a smart helper reads the news and
+writes a mood card for every toy: "SPY feels 7/10 happy today." The robot reads
+that card all day. If the helper oversleeps, the robot doesn't panic -- no
+feeling written just means "play normally," but a genuinely bad feeling still
+makes it buy umbrellas instead.
+
 ---
 
 ## The one-sentence version

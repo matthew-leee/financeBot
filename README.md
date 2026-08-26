@@ -241,6 +241,35 @@ submission with `client_order_id`, open-order counts, kill-switch cancels,
 and API health/error-rate telemetry. Legacy `src/trade_log.py` remains a
 shim for existing tests and the dashboard.
 
+### Daily sentiment pipeline (Gemini via OpenRouter)
+
+`generate_sentiment.py` is the morning helper behind `daily_sentiment.json`.
+Weekdays at 10:30 UTC (`deploy/financebot-sentiment.timer`) it:
+
+1. Resolves the active universe,
+2. Builds a compact momentum context per symbol (last close, 5d/20d return,
+   annualized vol) from recent bars,
+3. Makes ONE batched OpenAI-compatible chat call — defaults:
+   `LLM_BASE_URL=https://openrouter.ai/api/v1`, `LLM_MODEL=google/gemini-3.7-flash`,
+   key from the env var named by `LLM_API_KEY_ENV` (default `OPENAI_API_KEY`) —
+   requesting strict JSON `{ticker: {score 0-10, summary}}`,
+4. Atomically writes `daily_sentiment.json` in the exact schema the loop reads.
+
+Fail-closed: a missing API key or any LLM/parse error leaves yesterday's report
+untouched and exits 1. Symbols omitted by the model are simply absent from the
+report.
+
+**Missing-score semantics**: `SENTIMENT_MISSING_IS_PASS=true` (env
+`FINANCEBOT_SENTIMENT_MISSING_IS_PASS`, default true) treats an absent score as
+NEUTRAL-PASS — trade the target normally. An explicit low score always
+blocks/pivots regardless; only absence is neutral, never bad news. Set the flag
+false to restore legacy pivot-on-missing behavior.
+
+Install the scheduler alongside the trading service:
+
+    sudo cp deploy/financebot-sentiment.{service,timer} /etc/systemd/system/
+    sudo systemctl daemon-reload && sudo systemctl enable --now financebot-sentiment.timer
+
 ### Cash-account guards (T+1 settlement reality)
 
 Paper trading never simulates settlement, but live cash accounts cannot reuse
@@ -489,6 +518,10 @@ Legacy engine keeps its `BUY_THRESHOLD` proxy for now.
 | `FINANCEBOT_CASH_ACCOUNT_DAMPING` | bool | default `true`; scales/cooldowns exposure increases in the dual executor |
 | `FINANCEBOT_ALLOW_UNEARNED_PROMOTION` | bool | default `false`; override the growth_live evidence gate (loudly logged) |
 | `MIN_TRADE_EDGE_BPS` / `ESTIMATED_ROUND_TRIP_COST_BPS` | float | code constants; dual-engine entry edge floor / cost model |
+| `FINANCEBOT_SENTIMENT_MISSING_IS_PASS` | bool | default `true`; absent sentiment = neutral-pass |
+| `FINANCEBOT_LLM_BASE_URL` | URL | default OpenRouter (`https://openrouter.ai/api/v1`) |
+| `FINANCEBOT_LLM_MODEL` | str | default `google/gemini-3.7-flash` |
+| `OPENAI_API_KEY` (or custom via `FINANCEBOT_LLM_API_KEY_ENV`) | str | REQUIRED for the daily sentiment generator |
 
 Also see `README_SIMPLE.md` for a plain-language tour of the whole system.
 

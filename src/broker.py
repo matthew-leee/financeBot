@@ -198,6 +198,41 @@ class Broker:
             return None
         return not bool(shorting)
 
+    def is_fractionable(self, symbol: str) -> "bool | None":
+        """
+        Whether the asset supports fractional/notional orders.
+
+        Cached per process (asset rules are effectively static intraday).
+        Returns None when unknown -- callers keep their current behavior and
+        may still see a broker-side rejection. This pre-check exists because
+        several inverse ETFs reject fractional quantities outright
+        (e.g. Alpaca 40310000 "asset is not fractionable").
+        """
+        key = str(symbol).upper()
+        cached = getattr(self, "_fractional_cache", None)
+        if cached is None:
+            cached = {}
+            self._fractional_cache = cached
+        if key in cached:
+            return cached[key]
+
+        self._throttle()
+        try:
+            asset = self._client.get_asset(key.replace("/", ""))
+            raw = getattr(asset, "fractionable", None)
+            if raw is None:
+                raw = getattr(asset, "fractional_enabled", None)
+            result = bool(raw) if raw is not None else None
+        except Exception as exc:  # noqa: BLE001 -- unknown stays unknown
+            self._note(False, health=False)
+            print(f"[broker] is_fractionable({symbol}) failed: {exc}")
+            return None
+        self._note(True, health=False)
+        # Cache only definite answers; failures stay uncached so a transient
+        # network error never poisons the whole day.
+        cached[key] = result
+        return result
+
     def get_open_positions(self) -> list:
         """List of open positions; empty list on failure."""
         self._throttle()

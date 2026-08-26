@@ -107,7 +107,7 @@ def test_weak_sentiment_pivots_to_most_negatively_correlated_etf(monkeypatch, tm
     assert logged.iloc[0]["side"] == "buy"
 
 
-def test_missing_sentiment_report_also_pivots(monkeypatch, tmp_path) -> None:
+def test_missing_sentiment_report_is_neutral_pass(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(config, "TRADES_LOG_PATH", str(tmp_path / "trades_log.csv"))
     monkeypatch.setattr(config, "INVENTORY_STATE_PATH", str(tmp_path / "inventory.json"))
     _install_mock_fetch(monkeypatch, _correlation_universe())
@@ -115,8 +115,23 @@ def test_missing_sentiment_report_also_pivots(monkeypatch, tmp_path) -> None:
     broker = FakeBroker(held_qty=0.0)
     model = FakeModel(prob_up=config.BUY_THRESHOLD + 0.05)
 
-    # Empty report -> no score -> weak -> Active Pivot (NOT fail-closed anymore).
+    # Empty report -> no score -> NEUTRAL-PASS -> buy the target directly.
     execution.process_symbol("AAPL", model, broker, {})
+
+    assert len(broker.orders) == 1
+    assert broker.orders[0][0] == "AAPL"
+
+
+def test_explicit_weak_sentiment_still_pivots(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(config, "TRADES_LOG_PATH", str(tmp_path / "trades_log.csv"))
+    monkeypatch.setattr(config, "INVENTORY_STATE_PATH", str(tmp_path / "inventory.json"))
+    _install_mock_fetch(monkeypatch, _correlation_universe())
+
+    broker = FakeBroker(held_qty=0.0)
+    model = FakeModel(prob_up=config.BUY_THRESHOLD + 0.05)
+
+    # Explicit LOW score is real bad news -> Active Pivot (not neutral).
+    execution.process_symbol("AAPL", model, broker, {"AAPL": {"score": 3.0}})
 
     assert len(broker.orders) == 1
     assert broker.orders[0][0] == "PSQ"

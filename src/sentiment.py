@@ -74,14 +74,19 @@ def is_trade_allowed(
     min_score: float = config.SENTIMENT_MIN_SCORE,
 ) -> bool:
     """
-    True only if the symbol has a sentiment score >= min_score.
+    True if the symbol clears the daily sentiment threshold.
 
-    A missing/invalid score returns False -> the caller pivots to a hedge rather
-    than buying the weak target directly.
+    Missing/invalid scores follow ``config.SENTIMENT_MISSING_IS_PASS``:
+      * True (default) -> NEUTRAL-PASS: trade the target normally, so a
+        partial daily report no longer forces pivot-heavy behavior.
+      * False -> legacy semantics: treat as weak and let the caller pivot.
+
+    An EXPLICIT score below min_score always blocks/pivots regardless of the
+    flag -- only absence is neutral, never bad news.
     """
     score = get_score(report, symbol)
     if score is None:
-        return False
+        return bool(getattr(config, "SENTIMENT_MISSING_IS_PASS", False))
     return score >= min_score
 
 
