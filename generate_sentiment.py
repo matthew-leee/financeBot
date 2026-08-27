@@ -99,16 +99,90 @@ def _build_prompt(contexts: dict[str, dict]) -> tuple[str, str]:
 
 
 def _extract_json(text: str) -> dict:
-    """Defensive parse: models occasionally wrap JSON in prose/fences."""
+    """Layered parse: strict, then sanitize pass (trailing commas etc.)."""
     text = text.strip()
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
         raise ValueError("no JSON object found in model output")
-    return json.loads(text[start : end + 1])
+    blob = text[start : end + 1]
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError as first_err:
+        sanitized = _sanitize_json(blob)
+        return json.loads(sanitized)  # may raise with clearer context
+
+
+def _sanitize_json(blob: str) -> str:
+    """Repair the most common LLM JSON slips without changing semantics.
+
+    Handles trailing commas before } or ], stray control characters inside
+    strings (except \n and \t which we escape), and smart-quote substitutes.
+    """
+    import re
+
+    cleaned = re.sub(r",\s*([}\]])", r"\1", blob)
+    cleaned = "".join(
+        ch if ch >= " " or ch in "\n\t" else " " for ch in cleaned
+    )
+    cleaned = cleaned.replace("“", '"').replace("”", '"').replace("’", "'")
+    return cleaned
+
+
+_SALVAGE_RE = None  # compiled lazily
+
+
+def _salvage_entries(blob: str) -> dict:
+    """
+    Last-resort extraction of well-formed {SYM: {"score": x, ...}} fragments
+    from otherwise-unparseable output. Returns whatever valid pieces exist --
+    partial coverage is acceptable because neutral-pass semantics govern gaps.
+    """
+    import re
+
+    out: dict[str, tuple[float, str]] = {}
+    pattern = re.compile(
+        r'"([A-Za-z]{2,10})"\s*:\s*\{[^{}]*?"score"\s*:\s*'
+        r'"?([0-9]+(?:\.[0-9]+)?)"?[^{}]*?(?:"summary"\s*:\s*"([^"]*)")?[^{}]*?\}',
+        re.DOTALL,
+    )
+    for sym, score_raw, summary in pattern.findall(blob):
+        try:
+            score = max(0.0, min(10.0, float(score_raw)))
+        except ValueError:
+            continue
+        if not _finite(score):
+            continue
+        out[sym.upper()] = (score, (summary or "")[:140])
+    return {sym: {"score": score, "summary": summary} for sym, (score, summary) in out.items()}
 
 
 def _today() -> str:
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def _coerce_report(
+    raw_scores: dict,
+    *,
+    contexts: dict[str, dict],
+    today: str,
+) -> dict[str, dict]:
+    """Filter/clamp model scores into the on-disk report schema."""
+    report: dict[str, dict] = {}
+    for base, entry in raw_scores.items():
+        base_key = str(base).upper()
+        if isinstance(entry, dict):
+            score_raw = entry.get("score")
+            summary = str(entry.get("summary", ""))[:140]
+        else:
+            score_raw, summary = entry, ""
+        try:
+            score = max(0.0, min(10.0, float(score_raw)))
+        except (TypeError, ValueError):
+            continue  # omit malformed entries rather than fabricate
+        if base_key not in contexts or not _finite(score):
+            continue  # ignore hallucinated symbols / non-finite numbers
+        report[base_key] = {"date": today, "score": round(score, 2), "summary": summary}
+    return report
 
 
 def generate(
@@ -144,52 +218,89 @@ def generate(
 
     system, user = _build_prompt(contexts)
     post = transport or _http_post_json
-    payload = post(
-        f"{config.LLM_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            # OpenRouter attribution (optional but polite).
-            "X-Title": "financeBot",
-        },
-        body={
-            "model": config.LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.2,
-            "max_tokens": 1200,
-        },
-    )
-
-    content = payload["choices"][0]["message"]["content"]
-    raw_scores = _extract_json(content)
+    url = f"{config.LLM_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        # OpenRouter attribution (optional but polite).
+        "X-Title": "financeBot",
+    }
 
     today = _today()
-    report: dict[str, dict] = {}
-    for base, entry in raw_scores.items():
-        base_key = str(base).upper()
-        if isinstance(entry, dict):
-            score_raw, summary = entry.get("score"), str(entry.get("summary", ""))[:140]
-        else:
-            score_raw, summary = entry, ""
-        try:
-            score = max(0.0, min(10.0, float(score_raw)))
-        except (TypeError, ValueError):
-            continue  # omit malformed entries rather than fabricate
-        if base_key not in contexts:
-            continue  # ignore hallucinated symbols
-        report[base_key] = {"date": today, "score": round(score, 2), "summary": summary}
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
-    covered = len(report)
-    if covered == 0:
-        raise RuntimeError("Model returned no usable scores; keeping previous report.")
-    if covered < len(contexts):
+    max_attempts = max(int(config.SENTIMENT_LLM_MAX_ATTEMPTS), 1)
+    report: dict[str, dict] | None = None
+    raw_content = ""
+    last_err: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1 and last_err is not None:
+            # Self-correction round: show the model its own mistake.
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Your previous response was invalid JSON "
+                        f"({type(last_err).__name__}: {last_err}). Respond again "
+                        f"with ONLY the valid JSON object mapping every given "
+                        f'symbol to {{"score": <number 0-10>, "summary": '
+                        f'"<=12 words"}}.'
+                    ),
+                }
+            )
+        try:
+            payload = post(
+                url,
+                headers=headers,
+                body={
+                    "model": config.LLM_MODEL,
+                    "messages": messages,
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.2,
+                    "max_tokens": 1200,
+                },
+            )
+            raw_content = str(payload["choices"][0]["message"]["content"])
+            raw_scores = _extract_json(raw_content)
+            candidate = _coerce_report(raw_scores, contexts=contexts, today=today)
+            if candidate:
+                report = candidate
+                break
+            last_err = ValueError("no usable scores in parsed object")
+            print(f"[sentgen] attempt {attempt}/{max_attempts}: {last_err}")
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            last_err = exc
+            print(f"[sentgen] attempt {attempt}/{max_attempts} failed: {exc}")
+            if raw_content:
+                # Diagnostic breadcrumb; never includes secrets.
+                print(f"[sentgen] raw output head: {raw_content[:400]!r}")
+
+    if report is None and raw_content:
+        # Salvage: pull whatever well-formed fragments survive in bad output.
+        salvaged_raw = _salvage_entries(raw_content)
+        salvaged = _coerce_report(salvaged_raw, contexts=contexts, today=today)
+        if salvaged:
+            report = salvaged
+            print(
+                f"[sentgen] SALVAGED {len(report)} valid entries from malformed "
+                f"output after {max_attempts} attempt(s); uncovered symbols fall "
+                f"back to neutral-pass semantics."
+            )
+
+    if not report:
+        raise RuntimeError(
+            f"Unparseable model output after {max_attempts} attempt(s) "
+            f"({last_err}); keeping previous report."
+        )
+
+    if len(report) < len(contexts):
         print(
-            f"[sentgen] note: {len(contexts) - covered} symbol(s) omitted by "
-            f"model -> neutral-pass semantics will govern them."
+            f"[sentgen] note: {len(contexts) - len(report)} symbol(s) omitted -> "
+            f"neutral-pass semantics will govern them."
         )
 
     # Atomic replace: readers never observe a partial file.
@@ -197,7 +308,7 @@ def generate(
     with open(tmp_path, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)
     os.replace(tmp_path, out_path)
-    print(f"[sentgen] wrote {covered}/{len(universe)} scores -> {out_path}")
+    print(f"[sentgen] wrote {len(report)}/{len(universe)} scores -> {out_path}")
     return report
 
 

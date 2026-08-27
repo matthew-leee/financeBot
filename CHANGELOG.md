@@ -7,6 +7,24 @@ releases start being cut. Until then each entry maps to a push to `master`.
 ## [Unreleased]
 
 ### Added
+- Hedge pair lifecycle: pivot origins persisted to `models/hedge_pairs.json`
+  (`pairs` + persistent `origins` + transition stamps). Two cleanup rules now
+  close the hedge-holding loop:
+  * **Unwind** -- holding a paired hedge while its target regains a clean
+    direct-buy exits the hedge and clears the pair.
+  * **Rotation** -- holding a pivot-expressed target when today's sentiment is
+    explicitly bad releases the direct leg; re-entry as the hedge happens via
+    the normal pivot path. Sentiment-driven transitions are damped to once per
+    calendar day (`PAIR_TRANSITION_DAMPENER_DAYS`).
+- Daily sentiment generator robustness: layered parsing (strict -> trailing
+  comma/control-char sanitizer -> one self-correction re-prompt -> regex
+  salvage of valid fragments), diagnostic raw-output logging in journald on
+  failure, `SENTIMENT_LLM_MAX_ATTEMPTS`. A partial salvage still refreshes the
+  report; full failure keeps yesterday's file.
+- Decision-threshold env knobs: `FINANCEBOT_BUY_THRESHOLD` /
+  `FINANCEBOT_SELL_THRESHOLD` (strategy knobs, import-time validated 0 < sell
+  < buy < 1; defaults unchanged at 0.58 / 0.42).
+
 - `growth_live` risk profile (sized for $10k-30k equity) gated by
   `verify_promotion_evidence()`: >=50 fills, positive net FIFO PnL, p95
   slippage <= 25bps, non-KILL risk state. Override via

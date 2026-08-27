@@ -17,6 +17,12 @@ Two more tiny store rules the robot obeys:
 - If the umbrella shop is closed, the robot WAITS for it to open. No leaving
   notes to buy an umbrella at yesterday's price.
 
+And here's the clever bit about umbrellas: they're only rented, never hoarded!
+If the mood card turns good again for your candy, the robot hands the umbrella
+back and buys the candy instead. And if you own candy but the card suddenly
+turns grumpy, it swaps back to the umbrella. One flip per day max -- no dizzy
+back-and-forth because the weather can't make up its mind.
+
 ---
 
 ## The one-sentence version

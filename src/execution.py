@@ -26,8 +26,10 @@ Ordering of safety on every pass:
 from __future__ import annotations
 
 import math
+import os
 import sys
 import time
+from datetime import datetime, timezone
 
 import config
 from src import guardrails
@@ -158,6 +160,144 @@ def process_symbol(
 # with an in-memory ledger, pass-local market-data caching, and telemetry.
 
 _LEDGER_EPS = 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Hedge pair lifecycle (pivot-origin tracking -> unwind / rotation rules)
+# ---------------------------------------------------------------------------
+# A "pair" records WHICH TARGET a hedge was bought for (pivot origin). With
+# that provenance on disk, two cleanup rules become possible:
+#
+#   UNWIND   hold-H + target-T regains a clean direct-buy
+#            (P>=BUY_THRESHOLD AND sentiment pass)      -> sell H, clear pair
+#   ROTATION hold-T + T buy-signal + EXPLICIT bad news -> sell T
+#            (the news component of T's entry thesis broke)
+#
+# Entries into either leg always flow through the EXISTING paths on later
+# passes (direct buy / Active Pivot), so transitions are one clean reduction
+# each -- no same-pass sell/rebuy fights with the position-count gates.
+# Sentiment-driven transitions are dampened to once per calendar day per
+# symbol (mood-card jitter); model-driven exits stay event-driven.
+
+
+def _load_hedge_pairs(
+    path: str | None = None,
+) -> tuple[dict[str, str], dict[str, str], set[str]]:
+    """Load ({hedge: target}, {symbol: last-transition-date}, {origins}).
+
+    ``origins`` is the persistent set of targets that were EVER pivot-expressed;
+    it survives individual hedge exits so the rotation rule stays authorized.
+    Fail-safe: corrupt/missing file -> fresh empty state.
+    """
+    import json
+
+    path = path or config.HEDGE_PAIRS_PATH
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh) or {}
+            pairs = {str(k).upper(): str(v) for k, v in raw.get("pairs", {}).items()}
+            stamps = {
+                str(k).upper(): str(v) for k, v in raw.get("transitions", {}).items()
+            }
+            origins = {str(o).upper() for o in raw.get("origins", [])}
+            return pairs, stamps, origins
+    except Exception as exc:  # noqa: BLE001 -- corrupt state -> start fresh
+        print(f"[pairs] unreadable {path}: {exc}; starting fresh.")
+    return {}, {}, set()
+
+
+def _save_hedge_pairs(
+    pairs: dict[str, str],
+    stamps: dict[str, str],
+    origins: set[str] | None = None,
+    path: str | None = None,
+) -> None:
+    """Atomically persist pair state; failures logged, never fatal."""
+    import json
+    import tempfile
+
+    path = path or config.HEDGE_PAIRS_PATH
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "pairs": pairs,
+                        "transitions": stamps,
+                        "origins": sorted(origins or set()),
+                    },
+                    fh,
+                    indent=2,
+                )
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"[pairs] failed to persist {path}: {exc}")
+
+
+def _clear_hedge_pair(hedge: str, *, path: str | None = None) -> None:
+    """Remove a consumed/stale pair entry (no-op when absent).
+
+    Origins are intentionally KEPT: having once pivoted on a target means the
+    rotation rule remains authorized for it.
+    """
+    pairs, stamps, origins = _load_hedge_pairs(path)
+    key = str(hedge).upper()
+    if key in pairs:
+        del pairs[key]
+        _save_hedge_pairs(pairs, stamps, origins, path)
+
+
+def _target_is_clean_buy(model, target: str, pass_ctx) -> bool:
+    """
+    True when the PAIRED TARGET qualifies for a legitimate direct buy:
+    model says BUY and today's sentiment explicitly allows it. Reuses the
+    pass-local bar cache so this costs at most one extra data fetch per pass.
+    """
+    try:
+        bars = pass_ctx.get_bars(target, lookback_days=30)
+    except Exception:  # noqa: BLE001
+        return False
+    if bars is None or getattr(bars, "empty", True) or len(bars) < 30:
+        return False
+    feats = build_features(bars).dropna()
+    if feats.empty:
+        return False
+    prob_up = model.predict_up_proba(feats.iloc[[-1]])
+    if decide_action(prob_up) != "buy":
+        return False
+    return is_trade_allowed(pass_ctx.sentiment, target)
+
+
+def _record_pivot_pair(hedge: str, target: str, *, path: str | None = None) -> None:
+    pairs, stamps, origins = _load_hedge_pairs(path)
+    h_key, t_key = str(hedge).upper(), str(target)
+    pairs[h_key] = t_key
+    origins.add(t_key.upper())
+    _save_hedge_pairs(pairs, stamps, origins, path)
+
+
+def _rotation_allowed(symbol: str, stamps: dict[str, str]) -> bool:
+    """Once-per-calendar-day dampener for sentiment-driven transitions."""
+    days = max(int(getattr(config, "PAIR_TRANSITION_DAMPENER_DAYS", 1)), 0)
+    if days == 0:
+        return True
+    last = stamps.get(str(symbol).upper())
+    if not last:
+        return True
+    try:
+        last_date = datetime.fromisoformat(last).date()
+    except ValueError:
+        return True
+    return last_date < datetime.now(timezone.utc).date()
 
 
 def _num(value: object) -> "float | None":
@@ -456,7 +596,11 @@ def _hardened_pivot(symbol, broker, pass_ctx) -> None:
         return
     hedge_price = float(hedge_bars["close"].iloc[-1])
     print(f"[loop] {symbol}: PIVOT -> buying hedge {hedge} @ {hedge_price:.2f}.")
+    submitted_before = telem.submitted
     _hardened_buy(broker, hedge, hedge_price, pass_ctx)
+    if telem.submitted > submitted_before:
+        # Successful pivot: record origin so unwind/rotation lifecycle applies.
+        _record_pivot_pair(hedge, symbol)
 
 
 def _hardened_sell(broker, symbol, price, pass_ctx) -> None:
@@ -477,6 +621,20 @@ def _hardened_sell(broker, symbol, price, pass_ctx) -> None:
         append_trade(symbol, "sell", price, sell_qty)
         pass_ctx.ledger.apply_sell(symbol, sell_qty, price)
         telem.submitted += 1
+
+
+def _has_pending_exit(snapshot, symbol: str) -> bool:
+    """True when an open SELL order already exists for this symbol."""
+    if not getattr(snapshot, "open_orders_ok", False):
+        return False
+    want = _norm_key(symbol)
+    for order in getattr(snapshot, "open_orders", []) or []:
+        if (
+            _norm_key(getattr(order, "symbol", "")) == want
+            and str(getattr(order, "side", "")).lower().startswith("s")
+        ):
+            return True
+    return False
 
 
 def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
@@ -509,6 +667,26 @@ def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
     print(f"[loop] {symbol}: P(up)={prob_up:.3f} price={price:.2f} action={action}")
 
     is_target = _norm_key(symbol) in pass_ctx.active_target_keys
+    pairs, stamps, origins = _load_hedge_pairs()
+
+    paired_target = None
+    if not is_target:
+        # --- UNWIND: held paired hedge whose target is clean-buy-ready again --
+        paired_target = pairs.get(str(symbol).upper())
+        if (
+            paired_target
+            and getattr(pass_ctx.snapshot, "positions_ok", False)
+            and pass_ctx.ledger.held_quantity(symbol) > 0
+            and not _has_pending_exit(pass_ctx.snapshot, symbol)
+            and _target_is_clean_buy(model, paired_target, pass_ctx)
+        ):
+            print(
+                f"[pivot-unwind] {symbol}: paired target {paired_target} is a "
+                f"clean direct-buy now; exiting hedge."
+            )
+            _hardened_sell(broker, symbol, price, pass_ctx)
+            _clear_hedge_pair(str(symbol).upper())
+            return
 
     if action == "buy":
         if not is_target:
@@ -516,6 +694,31 @@ def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
             telem.skip("non_target_no_increase")
             print(f"[loop] {symbol}: held non-target, buys blocked (exit-only).")
             return
+
+        # --- ROTATION (holding the paired TARGET directly) -------------------
+        # Buy signal persists but today's news is explicitly bad -> the news
+        # leg of the entry thesis broke; release the direct leg. Re-entry as
+        # the hedge happens next pass through the normal Active Pivot path.
+        already_long = pass_ctx.ledger.is_long(symbol)
+        was_paired_origin = (
+            any(t == str(symbol) for t in pairs.values())
+            or str(symbol).upper() in origins
+        )
+        if (
+            already_long
+            and was_paired_origin
+            and not is_trade_allowed(pass_ctx.sentiment, symbol)
+            and _rotation_allowed(symbol, stamps)
+        ):
+            print(
+                f"[pair-rotate] {symbol}: buy signal with explicitly bad "
+                f"sentiment while long -> releasing direct leg."
+            )
+            _hardened_sell(broker, symbol, price, pass_ctx)
+            stamps[str(symbol).upper()] = datetime.now(timezone.utc).date().isoformat()
+            _save_hedge_pairs(pairs, stamps, origins)
+            return
+
         if is_trade_allowed(pass_ctx.sentiment, symbol):
             _hardened_buy(broker, symbol, price, pass_ctx)
         else:
@@ -523,6 +726,9 @@ def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
             _hardened_pivot(symbol, broker, pass_ctx)
     elif action == "sell":
         _hardened_sell(broker, symbol, price, pass_ctx)
+        # A completed exit releases any stale pivot-origin record.
+        if str(symbol).upper() in pairs:
+            _clear_hedge_pair(str(symbol).upper())
 
 
 def _enforce_circuit_breaker(broker, policy, snapshot) -> None:

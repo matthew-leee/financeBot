@@ -241,6 +241,31 @@ submission with `client_order_id`, open-order counts, kill-switch cancels,
 and API health/error-rate telemetry. Legacy `src/trade_log.py` remains a
 shim for existing tests and the dashboard.
 
+### Hedge pair lifecycle (unwind / rotation)
+
+Active Pivot hedges used to lack an exit policy beyond their own sell signal,
+so a hedge could linger indefinitely. Pivot origins are now persisted
+(`models/hedge_pairs.json`: `pairs`, persistent `origins`, `transitions`):
+
+- **Unwind** — holding hedge H for target T while T regains a legitimate
+  direct buy (P≥`BUY_THRESHOLD` AND sentiment passes) sells H and clears the
+  pair (`[pivot-unwind]`).
+- **Rotation** — holding target T that was ever pivot-expressed while its own
+  signal stays ≥BUY but today's card is explicitly bad (<`SENTIMENT_MIN_SCORE`)
+  sells T (`[pair-rotate]`); the hedge leg is re-entered next pass by the
+  normal pivot path.
+
+Both transitions are one reduction each — entries always reuse the existing
+direct/pivot paths on later passes, so no same-pass sell/rebuy races with the
+position-count gates. Sentiment-driven transitions run at most once per
+calendar day per symbol (mood-card jitter dampener); model-driven exits are
+uncapped. Night behavior: equity-leg trades wait for RTH as usual.
+
+The generator also hardens against malformed LLM JSON: strict parse →
+sanitize (trailing commas/smart quotes) → one self-correction re-prompt →
+regex salvage of valid fragments. Failed outputs are logged head-first into
+journald; yesterday's file survives total failure untouched.
+
 ### Fractionability & market-hours guards
 
 Two execution-path guards close real-money gaps observed in paper soak:
@@ -533,6 +558,7 @@ Legacy engine keeps its `BUY_THRESHOLD` proxy for now.
 | `FINANCEBOT_ALLOW_UNEARNED_PROMOTION` | bool | default `false`; override the growth_live evidence gate (loudly logged) |
 | `MIN_TRADE_EDGE_BPS` / `ESTIMATED_ROUND_TRIP_COST_BPS` | float | code constants; dual-engine entry edge floor / cost model |
 | `FINANCEBOT_SENTIMENT_MISSING_IS_PASS` | bool | default `true`; absent sentiment = neutral-pass |
+| `FINANCEBOT_BUY_THRESHOLD` / `FINANCEBOT_SELL_THRESHOLD` | float | decision conviction gates (defaults 0.58/0.42; validated 0<sell<buy<1) |
 | `FINANCEBOT_LLM_BASE_URL` | URL | default OpenRouter (`https://openrouter.ai/api/v1`) |
 | `FINANCEBOT_LLM_MODEL` | str | default `google/gemini-3.7-flash` |
 | `OPENAI_API_KEY` (or custom via `FINANCEBOT_LLM_API_KEY_ENV`) | str | REQUIRED for the daily sentiment generator |

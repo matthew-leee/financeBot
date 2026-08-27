@@ -93,8 +93,21 @@ MAX_LIVE_UNIVERSE_SIZE: int = 50
 
 # Probability thresholds applied to the model output (class prob of "up").
 # Deterministic: same prob in => same action out.
-BUY_THRESHOLD: float = 0.58
-SELL_THRESHOLD: float = 0.42
+#
+# These are STRATEGY KNOBS (conviction gates), not blast-radius guardrails --
+# they may be recalibrated via environment without code edits. They are still
+# validated at import: nonsense values crash the process before any capital is
+# at risk (fail-closed by construction).
+_BUY_THRESHOLD_DEFAULT = 0.58
+_SELL_THRESHOLD_DEFAULT = 0.42
+
+BUY_THRESHOLD: float = float(os.environ.get("FINANCEBOT_BUY_THRESHOLD", _BUY_THRESHOLD_DEFAULT))
+SELL_THRESHOLD: float = float(os.environ.get("FINANCEBOT_SELL_THRESHOLD", _SELL_THRESHOLD_DEFAULT))
+if not (0.0 < SELL_THRESHOLD < BUY_THRESHOLD < 1.0):
+    raise ValueError(
+        "Thresholds must satisfy 0 < SELL < BUY < 1 "
+        f"(got sell={SELL_THRESHOLD}, buy={BUY_THRESHOLD})."
+    )
 
 # ---------------------------------------------------------------------------
 # DATA / MODEL PATHS
@@ -129,6 +142,18 @@ LLM_BASE_URL: str = os.environ.get(
 LLM_MODEL: str = os.environ.get("FINANCEBOT_LLM_MODEL", "google/gemini-3.7-flash")
 LLM_API_KEY_ENV: str = os.environ.get("FINANCEBOT_LLM_API_KEY_ENV", "OPENAI_API_KEY")
 LLM_TIMEOUT_SECONDS: float = 90.0
+
+# Max LLM round-trips per generation: initial call + self-correction retries
+# before falling back to regex salvage (then keeping yesterday's report).
+SENTIMENT_LLM_MAX_ATTEMPTS: int = int(os.environ.get("FINANCEBOT_SENTIMENT_LLM_MAX_ATTEMPTS", "3"))
+
+# Hedge pair lifecycle state (pivot-origin tracking for unwind/rotation).
+HEDGE_PAIRS_PATH: str = "models/hedge_pairs.json"
+
+# Sentiment-driven pair transitions (rotate/unwind) are evaluated at most once
+# per calendar day per symbol to dampen mood-card jitter. Model-driven exits
+# (own sell signals, clean-buy unwind) are uncapped.
+PAIR_TRANSITION_DAMPENER_DAYS: int = 1
 
 # ---------------------------------------------------------------------------
 # ACTIVE PIVOT / DYNAMIC CORRELATION HEDGING
