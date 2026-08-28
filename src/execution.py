@@ -571,7 +571,33 @@ def _hardened_buy(broker, ticker, price, pass_ctx) -> None:
 def _hardened_pivot(symbol, broker, pass_ctx) -> None:
     """Weak-sentiment BUY -> buy the most negatively correlated inverse hedge."""
     telem = pass_ctx.telemetry
-    hedge = select_hedge_asset(symbol, bar_fetcher=pass_ctx.get_bars)
+
+    # Tier-aware candidate filter: a hedge that cannot currently be expressed
+    # (non-fractionable with 1 share > position cap) is excluded BEFORE
+    # correlation ranking, so the runner-up gets selected instead of a
+    # guaranteed broker rejection. Fractionability comes from the broker's
+    # cached asset lookup; unknown -> not excluded (order-time guards still apply).
+    exclude: set[str] = set()
+    frac_fn = getattr(broker, "is_fractionable", None)
+    if callable(frac_fn):
+        cap = resolve_position_cap(pass_ctx.policy, pass_ctx.ledger.equity)
+        for cand in config.INVERSE_SAFE_LIST:
+            try:
+                if frac_fn(cand) is False:
+                    # Definitively non-fractionable: expressable only if one
+                    # whole share fits inside the position cap.
+                    bars = pass_ctx.get_bars(cand, lookback_days=config.HEDGE_CORR_LOOKBACK_DAYS)
+                    price = (
+                        float(bars["close"].iloc[-1])
+                        if bars is not None and not getattr(bars, "empty", True)
+                        else None
+                    )
+                    if price is None or price > cap:
+                        exclude.add(cand.upper())
+            except Exception:  # noqa: BLE001 -- unknown stays unknown
+                continue
+
+    hedge = select_hedge_asset(symbol, bar_fetcher=pass_ctx.get_bars, exclude=exclude)
     if hedge is None:
         telem.skip("no_hedge")
         print(f"[loop] {symbol}: no hedge available, declining trade.")

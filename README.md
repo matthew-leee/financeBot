@@ -300,6 +300,10 @@ Two execution-path guards close real-money gaps observed in paper soak:
   40310000). For such assets `_hardened_buy` sizes in WHOLE shares within the
   position cap, and skips cleanly (`non_fractionable_too_expensive`) when even
   one share exceeds it. Unknown fractionability falls back to legacy sizing.
+- **Fractionability-aware hedge selection**: non-expressable candidates are
+  excluded before correlation ranking (`select_hedge_asset(exclude=...)`) --
+  the runner-up hedge is chosen instead of a guaranteed broker rejection.
+  Exclusion is tier-aware: names return automatically at larger caps.
 - **Closed-market hedge deferral** (`hedge_market_closed`): an Active Pivot to
   an equity-ETF hedge while the equity market is closed would queue a fill at
   stale reference prices. Such pivots are now deferred to the first post-open

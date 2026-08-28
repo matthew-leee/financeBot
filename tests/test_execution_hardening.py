@@ -229,7 +229,7 @@ def test_non_target_held_symbol_cannot_increase_but_can_sell(monkeypatch) -> Non
 # --- hedges, cache, and breaker -------------------------------------------
 
 def test_hedge_opens_only_through_existing_selection_and_risk_gate(monkeypatch) -> None:
-    def fake_select(symbol, bar_fetcher):
+    def fake_select(symbol, bar_fetcher, exclude=None):
         return "PSQ"
 
     monkeypatch.setattr(execution, "select_hedge_asset", fake_select)
@@ -248,7 +248,7 @@ def test_each_symbol_bars_fetched_at_most_once_per_pass(monkeypatch) -> None:
         calls[symbol] = calls.get(symbol, 0) + 1
         return _bars(start=100.0 if symbol != "PSQ" else 50.0)
 
-    def fake_select(symbol, bar_fetcher):
+    def fake_select(symbol, bar_fetcher, exclude=None):
         # Simulates existing hedge-selection calls; the selected hedge is reused
         # by _hardened_pivot instead of fetched again.
         bar_fetcher(symbol, lookback_days=30)

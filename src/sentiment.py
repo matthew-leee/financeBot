@@ -118,6 +118,7 @@ def select_hedge_asset(
     safe_list: list[str] | None = None,
     bar_fetcher=None,
     lookback_days: int | None = None,
+    exclude: set[str] | None = None,
 ) -> str | None:
     """
     Pick the inverse ETF most negatively correlated to the target.
@@ -126,11 +127,18 @@ def select_hedge_asset(
     safe_list, computes the Pearson correlation on the overlapping dates, and
     returns the ETF with the STRONGEST (most negative) correlation.
 
+    ``exclude`` skips candidates that cannot currently be expressed (e.g.
+    non-fractionable assets below the whole-share threshold at the active
+    profile) so the runner-up is selected instead of a guaranteed broker
+    rejection. Exclusion is tier-aware by construction: a name excluded at
+    $5 clips becomes eligible again at larger caps without config changes.
+
     Returns None if no candidate yields a computable correlation -- the caller
     then declines the trade instead of hedging blindly.
     """
     safe_list = safe_list if safe_list is not None else config.INVERSE_SAFE_LIST
     lookback_days = lookback_days or config.HEDGE_CORR_LOOKBACK_DAYS
+    excluded = {s.upper() for s in (exclude or set())}
 
     if bar_fetcher is None:
         from src.data import fetch_bars as bar_fetcher  # lazy import, testable
@@ -146,6 +154,9 @@ def select_hedge_asset(
 
     for etf in safe_list:
         if etf == target_symbol:
+            continue
+        if etf.upper() in excluded:
+            print(f"[hedge] {etf}: excluded from selection (not expressible).")
             continue
         etf_ret = daily_returns(bar_fetcher(etf, lookback_days=lookback_days))
         if etf_ret.empty:

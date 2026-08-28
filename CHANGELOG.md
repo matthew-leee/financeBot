@@ -57,6 +57,13 @@ releases start being cut. Until then each entry maps to a push to `master`.
 - `deploy/financebot.service` + `deploy/financebot-sentiment.{service,timer}`.
 
 ### Changed
+- Hedge selection is fractionability-aware: candidates that cannot be
+  expressed at the active profile (non-fractionable, 1 share > cap -- e.g.
+  SETH at $5 clips) are excluded BEFORE correlation ranking, so the runner-up
+  is chosen instead of a guaranteed broker rejection. Tier-aware by
+  construction: excluded names return automatically at larger caps.
+- Curator liquidity metric now uses daily-resampled dollar volume (hourly
+  averaging undercounted ~7x and over-dropped liquid sector ETFs).
 - Missing/invalid daily sentiment scores are now NEUTRAL-PASS by default
   (`FINANCEBOT_SENTIMENT_MISSING_IS_PASS=true`): targets trade normally when
   the report omits them. Explicit low scores still pivot. Legacy behavior

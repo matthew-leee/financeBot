@@ -99,9 +99,14 @@ def _quant_screen(symbols, *, fetcher=None) -> dict[str, dict]:
             continue
         close = bars["close"].astype("float64")
         vol = bars["volume"].astype("float64")
-        dollar_vol = float((close * vol).tail(20).mean())
+        # TRUE daily dollar volume: hourly bars undercount ~7x if averaged
+        # directly; sum to calendar days first (exact), then average 20d.
+        dollar_series = close * vol
+        if isinstance(dollar_series.index, pd.DatetimeIndex):
+            dollar_vol = float(dollar_series.resample("1D").sum().tail(20).mean())
+        else:
+            dollar_vol = float(dollar_series.tail(20).mean())
         ret_20d = float(close.iloc[-1] / close.iloc[-21] - 1.0) if len(close) >= 21 else 0.0
-        ret_60d = float(close.iloc[-1] / close.iloc[-1] - 1.0)
         ret_60d = float(close.iloc[-1] / close.iloc[0] - 1.0)
         daily = close.pct_change().dropna()
         vol20 = float(daily.tail(20).std(ddof=1) * (252 ** 0.5)) if len(daily) >= 3 else 0.0

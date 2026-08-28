@@ -364,3 +364,36 @@ def test_rotation_damped_once_per_day(tmp_path, monkeypatch) -> None:
     execution.process_symbol_hardened("AAPL", Model(0.99), broker, ctx)
 
     assert broker.orders == []  # damped: already transitioned today
+
+
+# --- fractionability-aware hedge selection -----------------------------------
+
+
+def test_pivot_skips_non_fractionable_and_picks_runner_up(monkeypatch) -> None:
+    # SETH wins the raw correlation contest but is non-fractionable and one
+    # share ($33) exceeds the $5 cap -> selection must fall to the runner-up.
+    universe = _correlation_universe("ETH/USD")
+    # SETH: strongest negative (perfect -r) but non-fractionable at $33/share.
+    universe["SETH"] = _bars_from_returns(-_rng_returns(universe), start=33.0)
+    monkeypatch.setattr(
+        execution, "fetch_bars", lambda sym, lookback_days: universe.get(sym, pd.DataFrame())
+    )
+
+    class FracBroker(Broker):
+        def is_fractionable(self, symbol):
+            return symbol != "SETH"  # only SETH is non-fractionable
+
+    broker = FracBroker()
+    ctx = _ctx(market_open=True, sentiment={"ETH": {"score": 1.0}}, active=("ETH/USD",))
+
+    execution.process_symbol_hardened("ETH/USD", Model(0.99), broker, ctx)
+
+    assert len(broker.orders) == 1
+    sym, _, side = broker.orders[0]
+    assert sym == "RWM" and side == "buy"  # runner-up (corr -1.0) selected
+
+
+def _rng_returns(universe):
+    import numpy as np
+
+    return np.random.default_rng(11).normal(0.0, 0.01, 60)
