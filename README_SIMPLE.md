@@ -23,6 +23,12 @@ back and buys the candy instead. And if you own candy but the card suddenly
 turns grumpy, it swaps back to the umbrella. One flip per day max -- no dizzy
 back-and-forth because the weather can't make up its mind.
 
+And every Sunday night, a librarian robot picks which candies are even ALLOWED
+on the shelves this week: it reads the government papers, the fresh newspapers,
+and checks how many people buy each candy daily -- then hands the shop a fresh
+list, and explains WHY it picked each one. Bad handwriting from the librarian?
+Last week's list stays up. No empty shelves ever.
+
 ---
 
 ## The one-sentence version

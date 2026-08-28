@@ -189,3 +189,15 @@ def test_all_profiles_listed_and_gated_set_matches():
     names = set(guardrails._RISK_PROFILES)
     assert {"research", "micro_live", "small_live", "growth_live"} <= names
     assert guardrails._EVIDENCE_GATED_PROFILES == frozenset({"growth_live"})
+
+
+def test_soak_profile_exact_formulas(monkeypatch):
+    monkeypatch.setenv("FINANCEBOT_RISK_PROFILE", "soak")
+    policy = resolve_risk_policy()
+    # Research sizing preserved: $5/order, -$10/day -- at ANY equity.
+    for equity in (1_000.0, 100_000.0):
+        assert resolve_position_cap(policy, equity) == 5.00
+        assert resolve_daily_loss_threshold(policy, equity) == -10.00
+    assert policy.max_open_positions == 12
+    assert policy.max_gross_exposure_pct == 0.05
+    assert guardrails._EVIDENCE_GATED_PROFILES == frozenset({"growth_live"})

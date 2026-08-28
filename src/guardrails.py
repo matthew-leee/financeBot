@@ -499,6 +499,19 @@ _RISK_PROFILES: dict[str, RiskPolicy] = {
         daily_loss_limit_abs=750.00,
         max_open_positions=8,
     ),
+    # Extended-throughput paper-soak tier: research sizing ($5/order, $10/day)
+    # with 12 concurrent slots so the soak accumulates statistically useful
+    # fill counts in days instead of months. Risk is unchanged (order cap +
+    # daily breaker bound the blast radius; slots gate data volume only).
+    "soak": RiskPolicy(
+        profile="soak",
+        max_position_pct=None,
+        max_gross_exposure_pct=0.05,
+        daily_loss_pct=None,
+        max_position_size_abs=5.00,
+        daily_loss_limit_abs=10.00,
+        max_open_positions=12,
+    ),
 }
 
 

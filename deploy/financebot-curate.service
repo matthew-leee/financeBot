@@ -1,0 +1,14 @@
+[Unit]
+Description=financeBot weekly universe curator (macro + news + Gemini)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=financebot
+Group=financebot
+WorkingDirectory=/opt/financebot
+EnvironmentFile=/etc/financebot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/financebot/.venv/bin/python /opt/financebot/curate_universe.py
+Nice=5

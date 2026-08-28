@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import config
 
 
@@ -30,3 +32,16 @@ def test_live_decision_thresholds_are_sane() -> None:
 def test_secret_values_are_not_hardcoded_in_config() -> None:
     assert not hasattr(config, "APCA_API_KEY_ID")
     assert not hasattr(config, "APCA_API_SECRET_KEY")
+
+
+def test_loop_interval_env_knob(monkeypatch):
+    monkeypatch.setenv("FINANCEBOT_LOOP_INTERVAL_SECONDS", "150")
+    import importlib
+
+    cfg = importlib.reload(config)
+    assert cfg.LOOP_INTERVAL_SECONDS == 150.0
+    monkeypatch.setenv("FINANCEBOT_LOOP_INTERVAL_SECONDS", "1")
+    with pytest.raises(ValueError):
+        importlib.reload(config)
+    monkeypatch.delenv("FINANCEBOT_LOOP_INTERVAL_SECONDS")
+    importlib.reload(config)

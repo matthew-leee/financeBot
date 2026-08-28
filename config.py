@@ -62,7 +62,10 @@ MAX_OPEN_POSITIONS: int = 3
 API_CALL_DELAY_SECONDS: float = 1.0
 
 # Seconds to sleep between each full pass of the execution loop.
-LOOP_INTERVAL_SECONDS: float = 60.0
+# Env-tunable: larger universes need longer cadences (see active_universe.json).
+LOOP_INTERVAL_SECONDS: float = float(os.environ.get("FINANCEBOT_LOOP_INTERVAL_SECONDS", "60.0"))
+if LOOP_INTERVAL_SECONDS < 5.0:
+    raise ValueError("LOOP_INTERVAL_SECONDS must be >= 5 (API citizenship).")
 
 # ---------------------------------------------------------------------------
 # TRADING UNIVERSE & DECISION THRESHOLDS
@@ -142,6 +145,21 @@ LLM_BASE_URL: str = os.environ.get(
 LLM_MODEL: str = os.environ.get("FINANCEBOT_LLM_MODEL", "google/gemini-3.7-flash")
 LLM_API_KEY_ENV: str = os.environ.get("FINANCEBOT_LLM_API_KEY_ENV", "OPENAI_API_KEY")
 LLM_TIMEOUT_SECONDS: float = 90.0
+
+# --- Weekly universe curator (political-economical research engine) ---------
+# Target active-pool size; the curator selects from FULL_CANDIDATE_UNIVERSE.
+UNIVERSE_CURATOR_TARGET_SIZE: int = int(
+    os.environ.get("FINANCEBOT_CURATOR_TARGET_SIZE", "32")
+)
+# Deterministic liquidity floor (avg daily dollar volume, USD). Applied by
+# CODE after the LLM proposes -- never delegated to the model.
+CURATOR_LIQUIDITY_FLOOR_USD: float = float(
+    os.environ.get("FINANCEBOT_CURATOR_LIQUIDITY_FLOOR_USD", "50000000")
+)
+# Max names per sector group in the final pool (forces breadth).
+CURATOR_MAX_PER_SECTOR: int = int(os.environ.get("FINANCEBOT_CURATOR_MAX_PER_SECTOR", "6"))
+# News lookback window for the research corpus (days).
+CURATOR_NEWS_LOOKBACK_DAYS: int = 7
 
 # Max LLM round-trips per generation: initial call + self-correction retries
 # before falling back to regex salvage (then keeping yesterday's report).

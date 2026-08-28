@@ -266,6 +266,31 @@ sanitize (trailing commas/smart quotes) → one self-correction re-prompt →
 regex salvage of valid fragments. Failed outputs are logged head-first into
 journald; yesterday's file survives total failure untouched.
 
+### Weekly universe curator (research engine)
+
+`curate_universe.py` (Sundays 22:00 UTC, `financebot-curate.timer`) decides
+WHAT is tradable -- the missing half of the macro loop:
+
+1. Quant screen over the 47-symbol candidate pool (liquidity $-volume,
+   20/60d momentum, vol, drawdown, corr-to-SPY) from 60d bars
+2. FRED macro brief (curve level/slope, CPI YoY, policy rate)
+3. Dated news corpus: per-symbol Google News RSS + Fed/Treasury/BLS policy
+   feeds (`src/news.py`, stdlib XML, per-feed fail-closed)
+4. ONE Gemini call with an explicit epistemics frame: training data declared
+   stale; provided dated headlines win; rationale must cite them
+5. Deterministic post-validation -- candidate-pool membership, liquidity
+   floor ($50M avg daily $vol), <=6 names per sector group, BTC/USD+ETH/USD
+   force-included, truncated to `FINANCEBOT_CURATOR_TARGET_SIZE` (32)
+
+Writes `active_universe.json` (schema v1) + `models/universe_rationale.json`
+(macro note + per-name cited rationale). Fail-closed: any error keeps last
+week's pool trading. Run manually with `--dry-run` to inspect a proposal.
+
+Install alongside the other schedulers:
+
+    sudo cp deploy/financebot-curate.{service,timer} /etc/systemd/system/
+    sudo systemctl daemon-reload && sudo systemctl enable --now financebot-curate.timer
+
 ### Fractionability & market-hours guards
 
 Two execution-path guards close real-money gaps observed in paper soak:
@@ -465,6 +490,7 @@ ceiling with a warning.
 | `micro_live` | `0.02`     | `0.25`  | `0.005`      | `$100.00`    | `$50.00`       | `3`           |
 | `small_live` | `0.05`     | `0.50`  | `0.01`       | `$1000.00`   | `$250.00`      | `5`           |
 | `growth_live`| `0.12`     | `0.85`  | `0.03`       | `$5000.00`   | `$750.00`      | `8`           |
+| `soak`       | none       | `0.05`  | none         | `$5.00`      | `$10.00`       | `12`          |
 
 At a $25k anchor, `growth_live` resolves to a $3,000/order cap (pct-bound),
 -$750 daily loss, 8 concurrent names. **`growth_live` is evidence-gated** --
@@ -561,7 +587,10 @@ Legacy engine keeps its `BUY_THRESHOLD` proxy for now.
 | `FINANCEBOT_BUY_THRESHOLD` / `FINANCEBOT_SELL_THRESHOLD` | float | decision conviction gates (defaults 0.58/0.42; validated 0<sell<buy<1) |
 | `FINANCEBOT_LLM_BASE_URL` | URL | default OpenRouter (`https://openrouter.ai/api/v1`) |
 | `FINANCEBOT_LLM_MODEL` | str | default `google/gemini-3.7-flash` |
-| `OPENAI_API_KEY` (or custom via `FINANCEBOT_LLM_API_KEY_ENV`) | str | REQUIRED for the daily sentiment generator |
+| `OPENAI_API_KEY` (or custom via `FINANCEBOT_LLM_API_KEY_ENV`) | str | REQUIRED for sentiment + universe curator |
+| `FINANCEBOT_LOOP_INTERVAL_SECONDS` | float | execution loop cadence (default 60; >= 5 validated) |
+| `FINANCEBOT_CURATOR_TARGET_SIZE` | int | weekly pool size (default 32) |
+| `FINANCEBOT_CURATOR_LIQUIDITY_FLOOR_USD` | float | quant liquidity floor (default $50M) |
 
 Also see `README_SIMPLE.md` for a plain-language tour of the whole system.
 

@@ -7,6 +7,19 @@ releases start being cut. Until then each entry maps to a push to `master`.
 ## [Unreleased]
 
 ### Added
+- Weekly universe curator (`curate_universe.py`, `financebot-curate.timer`
+  Sundays 22:00 UTC): the political-economical research engine. Builds a dated
+  news corpus (Google News RSS per candidate + Fed/Treasury/BLS policy feeds,
+  new `src/news.py`), a FRED macro brief, and a quant screen (liquidity,
+  momentum, vol, drawdown, corr-to-SPY) over all 47 candidates; one
+  epistemics-framed Gemini call proposes the pool; deterministic post-
+  validation enforces pool membership, liquidity floor, sector-cap breadth,
+  and forced BTC/ETH. Writes `active_universe.json` + audit rationale
+  artifact; fail-closed to last week's pool. `--dry-run` supported.
+- `soak` risk profile: research sizing ($5/order, $10/day) with 12 concurrent
+  slots -- data-gathering throughput without added blast radius.
+- `FINANCEBOT_LOOP_INTERVAL_SECONDS` env knob (validated >= 5).
+
 - Hedge pair lifecycle: pivot origins persisted to `models/hedge_pairs.json`
   (`pairs` + persistent `origins` + transition stamps). Two cleanup rules now
   close the hedge-holding loop:
