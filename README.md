@@ -590,7 +590,8 @@ Legacy engine keeps its `BUY_THRESHOLD` proxy for now.
 | `FINANCEBOT_SENTIMENT_MISSING_IS_PASS` | bool | default `true`; absent sentiment = neutral-pass |
 | `FINANCEBOT_BUY_THRESHOLD` / `FINANCEBOT_SELL_THRESHOLD` | float | decision conviction gates (defaults 0.58/0.42; validated 0<sell<buy<1) |
 | `FINANCEBOT_LLM_BASE_URL` | URL | default OpenRouter (`https://openrouter.ai/api/v1`) |
-| `FINANCEBOT_LLM_MODEL` | str | default `google/gemini-3.7-flash` |
+| `FINANCEBOT_LLM_MODEL` | str | default `z-ai/glm-5.3-flash` (cheap flash tier, reasoning off) |
+| `FINANCEBOT_LLM_MAX_TOKENS` | int | default 8000 (headroom for 32-symbol JSON) |
 | `OPENAI_API_KEY` (or custom via `FINANCEBOT_LLM_API_KEY_ENV`) | str | REQUIRED for sentiment + universe curator |
 | `FINANCEBOT_LOOP_INTERVAL_SECONDS` | float | execution loop cadence (default 60; >= 5 validated) |
 | `FINANCEBOT_CURATOR_TARGET_SIZE` | int | weekly pool size (default 32) |

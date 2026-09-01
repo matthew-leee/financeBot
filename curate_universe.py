@@ -270,7 +270,8 @@ def _gemini_select(system: str, user: str, *, transport=None) -> dict:
                     "messages": messages,
                     "response_format": {"type": "json_object"},
                     "temperature": 0.2,
-                    "max_tokens": 4000,
+                    "max_tokens": int(config.LLM_MAX_TOKENS),
+                    "reasoning": {"enabled": False},
                 },
             )
             return _extract_json(str(payload["choices"][0]["message"]["content"]))

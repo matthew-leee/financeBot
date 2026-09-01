@@ -126,3 +126,22 @@ def test_missing_key_fails_before_network(tmp_path):
     finally:
         if saved is not None:
             os.environ[config.LLM_API_KEY_ENV] = saved
+
+
+def test_request_body_has_headroom_and_reasoning_off(tmp_path, monkeypatch):
+    monkeypatch.setenv(config.LLM_API_KEY_ENV, "dummy-key-for-tests")
+    monkeypatch.setattr(
+        "generate_sentiment._momentum_context",
+        lambda sym, lookback_days: {"last_close": 1.0, "ret_5d_pct": 0.0,
+                                    "ret_20d_pct": 0.0, "ann_vol_pct": 10.0},
+    )
+    captured: dict = {}
+
+    def transport(url, *, headers, body):
+        captured.update(body)
+        return _payload(GOOD)
+
+    generate(universe=list(CONTEXTS), out_path=str(tmp_path / "ds.json"), transport=transport)
+    assert captured["max_tokens"] >= 8000
+    assert captured["reasoning"] == {"enabled": False}
+    assert "glm-5.3-flash" in captured["model"]

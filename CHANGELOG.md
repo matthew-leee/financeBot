@@ -57,6 +57,11 @@ releases start being cut. Until then each entry maps to a push to `master`.
 - `deploy/financebot.service` + `deploy/financebot-sentiment.{service,timer}`.
 
 ### Changed
+- Default LLM switched to `z-ai/glm-5.3-flash` (OpenRouter): current-gen flash
+  tier, ~14x cheaper than Gemini 3.7 Flash, with reasoning disabled in-request
+  and `max_tokens` raised to 8000 -- fixes the Monday truncation class where
+  Gemini's internal reasoning tokens consumed the completion budget and
+  amputated the 32-symbol JSON (salvage degraded coverage to 1/32).
 - Hedge selection is fractionability-aware: candidates that cannot be
   expressed at the active profile (non-fractionable, 1 share > cap -- e.g.
   SETH at $5 clips) are excluded BEFORE correlation ranking, so the runner-up

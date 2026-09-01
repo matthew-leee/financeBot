@@ -261,7 +261,10 @@ def generate(
                     "messages": messages,
                     "response_format": {"type": "json_object"},
                     "temperature": 0.2,
-                    "max_tokens": 1200,
+                    "max_tokens": int(config.LLM_MAX_TOKENS),
+                    # Disable invisible reasoning-token burn (the Monday
+                    # truncation class); ignored by non-reasoning providers.
+                    "reasoning": {"enabled": False},
                 },
             )
             raw_content = str(payload["choices"][0]["message"]["content"])

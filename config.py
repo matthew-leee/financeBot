@@ -142,9 +142,15 @@ SENTIMENT_MISSING_IS_PASS: bool = _env_flag("FINANCEBOT_SENTIMENT_MISSING_IS_PAS
 LLM_BASE_URL: str = os.environ.get(
     "FINANCEBOT_LLM_BASE_URL", "https://openrouter.ai/api/v1"
 ).rstrip("/")
-LLM_MODEL: str = os.environ.get("FINANCEBOT_LLM_MODEL", "google/gemini-3.7-flash")
+# Default: GLM 5.3 Flash via OpenRouter -- current-gen flash tier with
+# structured outputs at ~14x lower cost than Gemini 3.7 Flash, and no
+# invisible reasoning-token burn against max_tokens (Monday's truncation bug).
+LLM_MODEL: str = os.environ.get("FINANCEBOT_LLM_MODEL", "z-ai/glm-5.3-flash")
 LLM_API_KEY_ENV: str = os.environ.get("FINANCEBOT_LLM_API_KEY_ENV", "OPENAI_API_KEY")
 LLM_TIMEOUT_SECONDS: float = 90.0
+# Headroom for full 32-symbol JSON responses; reasoning is disabled in the
+# request body so completion tokens ~= visible output.
+LLM_MAX_TOKENS: int = int(os.environ.get("FINANCEBOT_LLM_MAX_TOKENS", "8000"))
 
 # --- Weekly universe curator (political-economical research engine) ---------
 # Target active-pool size; the curator selects from FULL_CANDIDATE_UNIVERSE.
