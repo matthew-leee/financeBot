@@ -1,5 +1,5 @@
 [Unit]
-Description=financeBot daily sentiment generator (Gemini via OpenRouter)
+Description=financeBot daily sentiment generator (LLM via OpenRouter)
 After=network-online.target
 Wants=network-online.target
 

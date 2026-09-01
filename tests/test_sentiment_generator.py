@@ -143,5 +143,5 @@ def test_request_body_has_headroom_and_reasoning_off(tmp_path, monkeypatch):
 
     generate(universe=list(CONTEXTS), out_path=str(tmp_path / "ds.json"), transport=transport)
     assert captured["max_tokens"] >= 8000
-    assert captured["reasoning"] == {"enabled": False}
+    assert captured["reasoning_effort"] == "low"
     assert "glm-5.3-flash" in captured["model"]

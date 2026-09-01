@@ -262,9 +262,11 @@ def generate(
                     "response_format": {"type": "json_object"},
                     "temperature": 0.2,
                     "max_tokens": int(config.LLM_MAX_TOKENS),
-                    # Disable invisible reasoning-token burn (the Monday
-                    # truncation class); ignored by non-reasoning providers.
-                    "reasoning": {"enabled": False},
+                    # Minimize invisible reasoning-token burn (the Monday
+                    # truncation class). effort=low is the universally
+                    # supported shape (GLM/DeepSeek/Gemini); "enabled:false"
+                    # is rejected by GLM hybrids with HTTP 400.
+                    "reasoning_effort": "low",
                 },
             )
             raw_content = str(payload["choices"][0]["message"]["content"])
