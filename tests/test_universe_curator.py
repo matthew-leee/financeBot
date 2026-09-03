@@ -134,3 +134,19 @@ def test_truncation_to_target_size():
 def test_sector_of_unknown_is_other():
     assert _sector_of("ZZZZ") == "other"
     assert _sector_of("NVDA") == "tech"
+
+
+def test_research_body_uses_supported_reasoning_shape(monkeypatch):
+    monkeypatch.setenv(config.LLM_API_KEY_ENV, "dummy-key-for-tests")
+    from curate_universe import _gemini_select
+
+    captured: dict = {}
+
+    def transport(url, *, headers, body):
+        captured.update(body)
+        return {"choices": [{"message": {"content": json.dumps({"symbols": ["SPY"], "rationale": {}, "macro_note": ""})}}]}
+
+    _gemini_select("sys", "user", transport=transport)
+    assert captured["max_tokens"] >= 8000
+    assert captured.get("reasoning_effort") == "low"
+    assert "reasoning" not in captured  # the rejected enabled:false shape

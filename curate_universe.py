@@ -271,7 +271,9 @@ def _gemini_select(system: str, user: str, *, transport=None) -> dict:
                     "response_format": {"type": "json_object"},
                     "temperature": 0.2,
                     "max_tokens": int(config.LLM_MAX_TOKENS),
-                    "reasoning": {"enabled": False},
+                    # GLM hybrids REQUIRE reasoning (enabled:false -> HTTP 400);
+                    # effort=low is the cross-model supported shape.
+                    "reasoning_effort": "low",
                 },
             )
             return _extract_json(str(payload["choices"][0]["message"]["content"]))
