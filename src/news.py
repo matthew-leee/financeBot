@@ -164,12 +164,17 @@ def fetch_symbol_news(
     sleeper: Callable[[float], None] | None = None,
     now: datetime | None = None,
 ) -> list[NewsItem]:
-    """Latest market headlines for one symbol via Google News RSS."""
-    lookback = float(lookback_days or config.CURATOR_NEWS_LOOKBACK_DAYS)
+    """Latest market headlines for one symbol via Google News RSS.
+
+    ``lookback_days`` scopes the query server-side (``when:Nd``) AND filters
+    client-side, so deep-trajectory pulls (e.g. 30d for strategist consults)
+    return a dated story arc instead of just today's wire.
+    """
+    lookback = int(lookback_days or config.CURATOR_NEWS_LOOKBACK_DAYS)
     return _fetch_feed(
         (
             "https://news.google.com/rss/search?q="
-            f"{symbol}+stock&hl=en-US&gl=US&ceid=US:en"
+            f"{symbol}+stock+when:{lookback}d&hl=en-US&gl=US&ceid=US:en"
         ),
         source=f"news:{symbol}",
         lookback_days=lookback,

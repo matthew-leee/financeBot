@@ -29,6 +29,12 @@ and checks how many people buy each candy daily -- then hands the shop a fresh
 list, and explains WHY it picked each one. Bad handwriting from the librarian?
 Last week's list stays up. No empty shelves ever.
 
+And the toy box got smarter twice: it now has a shelf space for every candy
+in the catalog, and when a toy has sat untouched for a whole week, the robot
+does not just toss it -- it asks the wise librarian, who reads a month of
+newspapers about that toy and says "keep, big things are coming" or "toss,
+the story is over." The librarian's answer always wins.
+
 ---
 
 ## The one-sentence version

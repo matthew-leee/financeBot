@@ -167,6 +167,21 @@ CURATOR_MAX_PER_SECTOR: int = int(os.environ.get("FINANCEBOT_CURATOR_MAX_PER_SEC
 # News lookback window for the research corpus (days).
 CURATOR_NEWS_LOOKBACK_DAYS: int = 7
 
+# --- Stale-conviction exit (on-call long-horizon strategist) ----------------
+# A held TARGET position that is old AND conviction-dead becomes purge-
+# eligible; an on-call strategist consult (deep research: 30d news
+# trajectory + macro + long-horizon stats) then decides KEEP or DISCARD.
+# Defaults toward KEEP on any failure (purge is the aggressive act).
+STALE_EXIT_DAYS: int = int(os.environ.get("FINANCEBOT_STALE_EXIT_DAYS", "7"))
+STALE_EXIT_DEADZONE_LOW: float = float(os.environ.get("FINANCEBOT_STALE_EXIT_LOW", "0.45"))
+STALE_EXIT_DEADZONE_HIGH: float = float(os.environ.get("FINANCEBOT_STALE_EXIT_HIGH", "0.55"))
+STRATEGIST_VERDICTS_PATH: str = "models/strategist_verdicts.json"
+
+# Slots = active universe size: when true, the resolved policy's
+# max_open_positions is replaced by the startup universe count (bounded by
+# the 50 hard cap). The book can then express the whole curated pool.
+SLOTS_FOLLOW_UNIVERSE: bool = _env_flag("FINANCEBOT_SLOTS_FOLLOW_UNIVERSE", False)
+
 # Max LLM round-trips per generation: initial call + self-correction retries
 # before falling back to regex salvage (then keeping yesterday's report).
 SENTIMENT_LLM_MAX_ATTEMPTS: int = int(os.environ.get("FINANCEBOT_SENTIMENT_LLM_MAX_ATTEMPTS", "3"))

@@ -25,11 +25,12 @@ Ordering of safety on every pass:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import config
 from src import guardrails
@@ -455,12 +456,13 @@ class _Pass:
     """Everything a single loop pass needs, resolved exactly once per pass."""
 
     def __init__(self, *, policy, snapshot, market_open, sentiment,
-                 active_target_keys) -> None:
+                 active_target_keys, now=None) -> None:
         self.policy = policy
         self.snapshot = snapshot
         self.market_open = market_open
         self.sentiment = sentiment
         self.active_target_keys = active_target_keys
+        self.now = now or datetime.now(timezone.utc)
         self.ledger = _ProjectedLedger(snapshot, policy)
         self.telemetry = _PassTelemetry()
         self._bar_cache: dict[str, object] = {}
@@ -663,6 +665,291 @@ def _has_pending_exit(snapshot, symbol: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# On-call long-horizon strategist (stale-conviction exit consultation)
+# ---------------------------------------------------------------------------
+# When a held TARGET goes stale (>= STALE_EXIT_DAYS) AND conviction-dead
+# (P(up) inside the dead zone), an on-call strategist performs a DEEP
+# research pass -- 30-day news trajectory, FRED macro regime, long-horizon
+# quant stats -- and rules KEEP or DISCARD. Deliberately NOT a daily news
+# glance: the verdict must weigh the story arc and long-term potential
+# against short-term boredom.
+#
+# Defaults: KEEP on any failure (purge is the aggressive act), one consult
+# per symbol per calendar day (verdict cache), re-consulted daily while the
+# position stays purge-eligible.
+
+
+def _load_verdicts(path: str | None = None) -> dict[str, dict]:
+    import json
+
+    path = path or config.STRATEGIST_VERDICTS_PATH
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                return {str(k).upper(): dict(v) for k, v in (json.load(fh) or {}).items()}
+    except Exception as exc:  # noqa: BLE001 -- corrupt cache -> fresh
+        print(f"[strategist] unreadable verdict cache {path}: {exc}")
+    return {}
+
+
+def _save_verdicts(verdicts: dict[str, dict], path: str | None = None) -> None:
+    import json
+    import tempfile
+
+    path = path or config.STRATEGIST_VERDICTS_PATH
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(verdicts, fh, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"[strategist] failed to persist verdicts: {exc}")
+
+
+def _position_age_days(symbol: str, *, now: datetime | None = None) -> float | None:
+    """
+    Days since the most recent BUY of this symbol, from trades_log.csv (the
+    legacy book of record). None when no open-origined buy exists.
+    """
+    import csv as _csv
+
+    path = config.TRADES_LOG_PATH
+    now = now or datetime.now(timezone.utc)
+    last_buy: datetime | None = None
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", newline="", encoding="utf-8") as fh:
+            for row in _csv.DictReader(fh):
+                if (
+                    str(row.get("ticker", "")).upper() == str(symbol).upper()
+                    and str(row.get("side", "")).lower() == "buy"
+                ):
+                    try:
+                        ts = datetime.fromisoformat(str(row.get("timestamp", "")))
+                    except ValueError:
+                        continue
+                    if last_buy is None or ts > last_buy:
+                        last_buy = ts
+    except Exception as exc:  # noqa: BLE001
+        print(f"[strategist] age lookup failed for {symbol}: {exc}")
+        return None
+    if last_buy is None:
+        return None
+    if last_buy.tzinfo is None:
+        last_buy = last_buy.replace(tzinfo=timezone.utc)
+    return (now - last_buy).total_seconds() / 86400.0
+
+
+def _strategist_consult(
+    symbol: str,
+    *,
+    held_days: float,
+    prob_up: float,
+    sentiment_report: dict,
+    transport=None,
+    http_get=None,
+    fetcher=None,
+    macro_connector=None,
+    now: datetime | None = None,
+    verdicts_path: str | None = None,
+) -> tuple[str, str]:
+    """
+    Deep-research verdict for one purge-eligible position: (decision, reason).
+
+    decision ∈ {"keep", "discard"}; any failure defaults to "keep".
+    Cached once per symbol per calendar day.
+    """
+    from datetime import timezone as _tz
+
+    now = now or datetime.now(_tz.utc)
+    today = now.date().isoformat()
+    key = str(symbol).upper()
+
+    verdicts = _load_verdicts(verdicts_path)
+    cached = verdicts.get(key)
+    if cached and str(cached.get("date")) == today:
+        return str(cached.get("decision", "keep")), str(cached.get("reason", "cached"))
+
+    # --- research file ------------------------------------------------------
+    long_stats: dict = {}
+    try:
+        fetch = fetcher or __import__("src.data", fromlist=["fetch_bars"]).fetch_bars
+        bars = fetch(symbol, lookback_days=400)
+        if bars is not None and not getattr(bars, "empty", True):
+            import numpy as _np
+            import pandas as _pd
+
+            close = bars["close"].astype("float64")
+            for name, span in (("ret_20d", 20), ("ret_60d", 60), ("ret_126d", 126), ("ret_252d", 252)):
+                if len(close) > span:
+                    long_stats[name] = round(float(close.iloc[-1] / close.iloc[-1 - span] - 1.0) * 100, 2)
+            daily = close.pct_change().dropna()
+            if len(daily) >= 20:
+                long_stats["ann_vol_pct"] = round(float(daily.tail(20).std(ddof=1) * (252 ** 0.5)) * 100, 2)
+            if len(close) >= 60:
+                long_stats["drawdown_60d_pct"] = round(float(close.iloc[-1] / close.tail(60).max() - 1.0) * 100, 2)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[strategist] long stats unavailable for {symbol}: {exc}")
+
+    news_items: list = []
+    try:
+        from src import news as news_mod
+
+        news_items = news_mod.fetch_symbol_news(
+            symbol,
+            lookback_days=min(30, max(int(held_days) + 5, 10)),
+            max_items=15,
+            now=now,
+            **({"http_get": http_get} if http_get else {}),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[strategist] news trajectory unavailable for {symbol}: {exc}")
+
+    macro: dict = {}
+    try:
+        from src.macro import FredConnector
+
+        macro_connector = macro_connector or FredConnector()
+        recs = macro_connector.fetch_series(
+            series_ids=("DGS2", "DGS10", "CPIAUCSL", "FEDFUNDS"),
+            start=now - timedelta(days=400),
+            end=now,
+        )
+        series: dict[str, list[tuple[datetime, float]]] = {}
+        for r in recs:
+            try:
+                series.setdefault(r.entity_id, []).append((r.event_time, float(r.value)))
+            except (TypeError, ValueError):
+                continue
+        for ent, pts in series.items():
+            pts.sort()
+            macro[ent] = pts[-1][1]
+    except Exception as exc:  # noqa: BLE001
+        macro = {"note": f"macro unavailable: {exc}"}
+
+    research = {
+        "as_of": today,
+        "position": {
+            "symbol": key,
+            "held_days": round(float(held_days), 1),
+            "prob_up_today": round(float(prob_up), 3),
+            "sentiment_score_today": _sentiment_score(sentiment_report, symbol),
+        },
+        "long_horizon_stats": long_stats,
+        "macro": macro,
+        "news_trajectory": [
+            {"age_days": round(it.age_days(now), 1), "title": it.title}
+            for it in news_items
+        ],
+    }
+
+    system = (
+        "You are the long-horizon strategist for a micro-size systematic "
+        "trader. A position has gone STALE: held a long time with dead "
+        "short-term momentum (that is why you are consulted). Your job is to "
+        "judge LONG-TERM potential, not today's tape: weigh the 30-day news "
+        "TRAJECTORY (how the story evolves), the macro regime, and the "
+        "long-horizon statistics. A quiet week does not justify discarding a "
+        "position with an intact long-term thesis; a deteriorating story "
+        "justifies exit even if the quiet looks calm. Cite specific dated "
+        "headlines or data in your reason. Respond STRICT JSON only: "
+        '{"decision": "keep"|"discard", "confidence": <0-1>, "reason": '
+        '"<=25 words"}.'
+    )
+    user = json.dumps(research)
+
+    try:
+        from curate_universe import _gemini_select
+
+        out = _gemini_select(system, user, transport=transport)
+    except Exception as exc:  # noqa: BLE001 -- fail-closed toward holding
+        print(f"[strategist] consult failed for {symbol}: {exc}; defaulting KEEP.")
+        decision, reason = "keep", "strategist unavailable"
+        _cache_verdict(verdicts, key, today, decision, reason, verdicts_path)
+        return decision, reason
+
+    decision = str(out.get("decision", "keep")).strip().lower()
+    if decision not in ("keep", "discard"):
+        decision = "keep"
+    reason = str(out.get("reason", ""))[:200]
+    _cache_verdict(verdicts, key, today, decision, reason, verdicts_path)
+    return decision, reason
+
+
+def _sentiment_score(report: dict, symbol: str) -> float | None:
+    from src.sentiment import get_score
+
+    return get_score(report or {}, symbol)
+
+
+def _cache_verdict(
+    verdicts: dict[str, dict], key: str, today: str, decision: str, reason: str,
+    path: str | None = None,
+) -> None:
+    verdicts[key] = {"date": today, "decision": decision, "reason": reason}
+    _save_verdicts(verdicts, path)
+    print(f"[strategist] {key}: {decision.upper()} ({reason})")
+
+
+def _stale_exit_check(
+    symbol: str,
+    *,
+    model,
+    prob_up: float,
+    pass_ctx,
+    broker,
+    price: float,
+    now: datetime,
+) -> bool:
+    """
+    True when a stale-conviction exit was executed. Purge-eligible = held
+    TARGET, age >= STALE_EXIT_DAYS, P(up) in the dead zone. Consultation is
+    once per symbol per day; KEEP suppresses the exit for today.
+    """
+    if not (config.STALE_EXIT_DEADZONE_LOW <= prob_up <= config.STALE_EXIT_DEADZONE_HIGH):
+        return False
+    age = _position_age_days(symbol, now=now)
+    if age is None or age < float(config.STALE_EXIT_DAYS):
+        return False
+
+    verdicts = _load_verdicts()
+    cached = verdicts.get(str(symbol).upper())
+    if cached and str(cached.get("date")) == now.date().isoformat():
+        if str(cached.get("decision")) == "keep":
+            return False
+        # stale DISCARD cached today -> execute
+        print(
+            f"[stale-exit] {symbol}: {age:.1f}d held, dead conviction, cached "
+            f"DISCARD -> releasing."
+        )
+        _hardened_sell(broker, symbol, price, pass_ctx)
+        return True
+
+    decision, reason = _strategist_consult(
+        symbol,
+        held_days=age,
+        prob_up=prob_up,
+        sentiment_report=pass_ctx.sentiment,
+        now=now,
+    )
+    if decision == "discard":
+        print(f"[stale-exit] {symbol}: strategist DISCARD ({reason}) -> releasing.")
+        _hardened_sell(broker, symbol, price, pass_ctx)
+        return True
+    print(f"[stale-exit] {symbol}: strategist KEEP ({reason}) -> holding.")
+    return False
+
+
 def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
     """Hardened per-symbol decision cycle for the live loop."""
     telem = pass_ctx.telemetry
@@ -713,6 +1000,17 @@ def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
             _hardened_sell(broker, symbol, price, pass_ctx)
             _clear_hedge_pair(str(symbol).upper())
             return
+
+    # --- STALE-CONVICTION EXIT (held target; on-call strategist) -----------
+    if (
+        is_target
+        and pass_ctx.ledger.is_long(symbol)
+        and _stale_exit_check(
+            symbol, model=model, prob_up=prob_up, pass_ctx=pass_ctx,
+            broker=broker, price=price, now=pass_ctx.now,
+        )
+    ):
+        return
 
     if action == "buy":
         if not is_target:
@@ -812,6 +1110,13 @@ def run() -> None:
         print(f"[startup] ABORT -- universe resolution failed: {exc}")
         sys.exit(1)
 
+    # Slots = pool size: the book can express the whole curated universe.
+    if config.SLOTS_FOLLOW_UNIVERSE:
+        import dataclasses
+
+        policy = dataclasses.replace(policy, max_open_positions=len(active_targets))
+        print(f"[startup] slots follow universe -> max_open_positions={len(active_targets)}")
+
     active_target_keys = {_norm_key(sym) for sym in active_targets}
     print(
         f"[startup] risk profile={policy.profile} active_targets={len(active_targets)}"
@@ -849,6 +1154,7 @@ def run() -> None:
             market_open=market_open,
             sentiment=sentiment_report,
             active_target_keys=active_target_keys,
+            now=datetime.now(timezone.utc),
         )
 
         for symbol in processing:

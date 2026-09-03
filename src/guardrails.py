@@ -510,7 +510,10 @@ _RISK_PROFILES: dict[str, RiskPolicy] = {
         daily_loss_pct=None,
         max_position_size_abs=5.00,
         daily_loss_limit_abs=10.00,
-        max_open_positions=12,
+        # Effective slots = active universe size when SLOTS_FOLLOW_UNIVERSE
+        # is on (execution replaces this field with the startup pool count);
+        # 50 is the hard ceiling the pool itself can never exceed.
+        max_open_positions=50,
     ),
 }
 

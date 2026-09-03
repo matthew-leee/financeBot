@@ -494,11 +494,35 @@ ceiling with a warning.
 | `micro_live` | `0.02`     | `0.25`  | `0.005`      | `$100.00`    | `$50.00`       | `3`           |
 | `small_live` | `0.05`     | `0.50`  | `0.01`       | `$1000.00`   | `$250.00`      | `5`           |
 | `growth_live`| `0.12`     | `0.85`  | `0.03`       | `$5000.00`   | `$750.00`      | `8`           |
-| `soak`       | none       | `0.05`  | none         | `$5.00`      | `$10.00`       | `12`          |
+| `soak`       | none       | `0.05`  | none         | `$5.00`      | `$10.00`       | `50`*         |
 
 At a $25k anchor, `growth_live` resolves to a $3,000/order cap (pct-bound),
 -$750 daily loss, 8 concurrent names. **`growth_live` is evidence-gated** --
 see "Promotion evidence gate" below.
+
+\* soak: with `FINANCEBOT_SLOTS_FOLLOW_UNIVERSE=true` the effective slot
+count equals the startup universe size (pool of 32 -> 32 slots); 50 is the
+hard ceiling.
+
+### Stale-conviction exit (on-call long-horizon strategist)
+
+A held target that goes **stale** (>= 7 days, `FINANCEBOT_STALE_EXIT_DAYS`)
+and **conviction-dead** (P(up) inside the 0.45-0.55 dead zone,
+`FINANCEBOT_STALE_EXIT_LOW/HIGH`) triggers an on-call strategist consult --
+a deep research pass, not a daily glance:
+
+- **30-day news trajectory** for the name (dated headlines, story arc)
+- **FRED macro regime** (curve, CPI, policy rate)
+- **Long-horizon stats** (126d/252d momentum, vol, drawdown)
+- Position facts (age, entry-vs-current, today's mood + P(up))
+
+The strategist rules **KEEP or DISCARD** (strict JSON, must cite specific
+headlines/data). KEEP holds the position today and is re-consulted daily
+while still stale; DISCARD releases it via the standard exit path
+(`[stale-exit]`). Verdicts are cached once per symbol per day
+(`models/strategist_verdicts.json`); any LLM failure defaults to KEEP.
+Targets only -- hedges remain governed by pair lifecycle + own signals.
+Slots: `FINANCEBOT_SLOTS_FOLLOW_UNIVERSE=true` sizes the book to the pool.
 
 Exact formulas:
 

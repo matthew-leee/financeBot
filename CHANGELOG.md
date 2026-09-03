@@ -7,6 +7,15 @@ releases start being cut. Until then each entry maps to a push to `master`.
 ## [Unreleased]
 
 ### Added
+- Stale-conviction exit with on-call long-horizon strategist: held targets
+  aged >= `FINANCEBOT_STALE_EXIT_DAYS` (7) with dead conviction
+  (`FINANCEBOT_STALE_EXIT_LOW/HIGH` band, default 0.45-0.55) trigger a deep
+  research consult -- 30-day news trajectory (Google News `when:Nd`), FRED
+  macro regime, long-horizon stats -- and the verdict (KEEP/DISCARD, cached
+  once per symbol per day, KEEP re-consulted daily) gates the exit. Any LLM
+  failure defaults to KEEP. Targets only; hedges keep pair lifecycle.
+- `SLOTS_FOLLOW_UNIVERSE` (default false): effective max_open_positions =
+  startup universe size; soak profile ceiling raised to 50.
 - Weekly universe curator (`curate_universe.py`, `financebot-curate.timer`
   Sundays 22:00 UTC): the political-economical research engine. Builds a dated
   news corpus (Google News RSS per candidate + Fed/Treasury/BLS policy feeds,

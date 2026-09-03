@@ -198,6 +198,6 @@ def test_soak_profile_exact_formulas(monkeypatch):
     for equity in (1_000.0, 100_000.0):
         assert resolve_position_cap(policy, equity) == 5.00
         assert resolve_daily_loss_threshold(policy, equity) == -10.00
-    assert policy.max_open_positions == 12
+    assert policy.max_open_positions == 50  # ceiling; effective = universe size
     assert policy.max_gross_exposure_pct == 0.05
     assert guardrails._EVIDENCE_GATED_PROFILES == frozenset({"growth_live"})
