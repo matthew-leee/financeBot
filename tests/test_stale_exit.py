@@ -265,3 +265,115 @@ def test_slots_follow_universe_replaces_policy():
     updated = dataclasses.replace(policy, max_open_positions=len(universe))
     assert updated.max_open_positions == 3
     assert policy.max_open_positions == 12  # original immutable
+
+
+# --- mid-run universe refresh -----------------------------------------------
+
+
+def test_refresh_picks_up_pool_change_and_reslots(tmp_path, monkeypatch):
+    uni = tmp_path / "active_universe.json"
+    uni.write_text(
+        json.dumps({"version": 1, "as_of": "2026-09-08T00:00:00Z", "symbols": ["AAA", "BBB"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "ACTIVE_UNIVERSE_PATH", str(uni))
+    monkeypatch.setattr(config, "SLOTS_FOLLOW_UNIVERSE", True)
+
+    policy = _policy()  # 12 slots
+    state: dict = {"fingerprint": execution._universe_file_fingerprint()}
+    p1, t1, k1, changed = execution._maybe_refresh_universe(
+        policy, ["OLD"], {execution._norm_key("OLD")}, state
+    )
+    assert changed is False  # first sighting: baseline, no change event
+    assert t1 == ["OLD"]
+
+    # Curator writes a new pool (content + mtime change).
+    import os as _os
+    import time as _time
+
+    _time.sleep(0.01)
+    uni.write_text(
+        json.dumps({"version": 1, "as_of": "2026-09-09T00:00:00Z", "symbols": ["CCC", "DDD", "EEE"]}),
+        encoding="utf-8",
+    )
+    _os.utime(uni, None)
+    p2, t2, k2, changed = execution._maybe_refresh_universe(policy, t1, k1, state)
+    assert changed is True
+    assert sorted(t2) == ["CCC", "DDD", "EEE"]
+    assert p2.max_open_positions == 3  # slots follow universe
+    # Third call: no further change event.
+    _, t3, _, changed3 = execution._maybe_refresh_universe(p2, t2, k2, state)
+    assert changed3 is False and t3 == t2
+
+
+def test_refresh_failure_keeps_previous_targets(tmp_path, monkeypatch):
+    uni = tmp_path / "active_universe.json"
+    uni.write_text(
+        json.dumps({"version": 1, "as_of": "2026-09-08T00:00:00Z", "symbols": ["AAA"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "ACTIVE_UNIVERSE_PATH", str(uni))
+    state: dict = {"fingerprint": execution._universe_file_fingerprint()}
+    p0, t0, k0, _ = execution._maybe_refresh_universe(_policy(), ["OLD"], set(), state)
+
+    # Corrupt the file AND force strict mode so resolution raises.
+    uni.write_text("{broken", encoding="utf-8")
+    import os as _os
+    _os.utime(uni, None)
+    monkeypatch.setattr(config, "PAPER", False)  # strict on
+    monkeypatch.setenv("FINANCEBOT_UNIVERSE_STRICT", "true")
+
+    p1, t1, k1, changed = execution._maybe_refresh_universe(p0, t0, k0, state)
+    assert changed is False
+    assert t1 == ["OLD"]  # fail-conservative
+
+
+# --- orphan review (ex-targets dropped by pool churn) ------------------------
+
+
+def test_pool_dropped_ex_target_gets_strategist_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "HEDGE_PAIRS_PATH", str(tmp_path / "h.json"))
+    monkeypatch.setattr(config, "STRATEGIST_VERDICTS_PATH", str(tmp_path / "v.json"))
+    monkeypatch.setattr(config, "TRADES_LOG_PATH", _seed_trades_log(tmp_path, symbol="MSFT", days_ago=10))
+    monkeypatch.setattr(execution, "fetch_bars", lambda sym, lookback_days: _bars(100, 100.0))
+    monkeypatch.setattr(execution, "_strategist_consult", lambda sym, **kw: ("discard", "dropped from pool"))
+    broker = Broker()
+    # MSFT held but NOT in active targets (pool churn dropped it); in origins.
+    ctx = _ctx(sentiment={}, active=("OTHER",), positions=[_pos("MSFT")])
+    ctx.ledger.reserve_buy("MSFT", 5.0)
+    ctx.now = NOW
+
+    execution.process_symbol_hardened("MSFT", Model(0.50), broker, ctx)
+
+    assert broker.orders == [("MSFT", 1.0, "sell")]
+
+
+def test_hedges_are_exempt_from_orphan_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "HEDGE_PAIRS_PATH", str(tmp_path / "h.json"))
+    monkeypatch.setattr(config, "STRATEGIST_VERDICTS_PATH", str(tmp_path / "v.json"))
+    monkeypatch.setattr(config, "TRADES_LOG_PATH", _seed_trades_log(tmp_path, symbol="RWM", days_ago=10))
+    monkeypatch.setattr(execution, "fetch_bars", lambda sym, lookback_days: _bars(100, 100.0))
+    monkeypatch.setattr(execution, "_strategist_consult", lambda sym, **kw: (_ for _ in ()).throw(AssertionError("hedge consulted")))
+    broker = Broker()
+    execution._save_hedge_pairs({"RWM": "BTC/USD"}, {}, set(), str(tmp_path / "h.json"))
+    ctx = _ctx(sentiment={}, active=("OTHER",), positions=[_pos("RWM")])
+    ctx.ledger.reserve_buy("RWM", 5.0)
+    ctx.now = NOW
+
+    execution.process_symbol_hardened("RWM", Model(0.50), broker, ctx)
+
+    assert broker.orders == []  # hedge lifecycle governs, no strategist consult
+
+
+def test_target_buy_registers_origin(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "HEDGE_PAIRS_PATH", str(tmp_path / "h.json"))
+    monkeypatch.setattr(config, "TRADES_LOG_PATH", str(tmp_path / "t.csv"))
+    monkeypatch.setattr(execution, "fetch_bars", lambda sym, lookback_days: _bars(60, 100.0))
+    broker = Broker()
+    ctx = _ctx(sentiment={"AAPL": {"score": 8.0}}, active=("AAPL",), positions=[])
+
+    execution.process_symbol_hardened("AAPL", Model(0.99), broker, ctx)
+
+    assert len(broker.orders) == 1
+    _, _, origins = execution._load_hedge_pairs(str(tmp_path / "h.json"))
+    assert "AAPL" in origins

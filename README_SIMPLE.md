@@ -27,7 +27,8 @@ And every Sunday night, a librarian robot picks which candies are even ALLOWED
 on the shelves this week: it reads the government papers, the fresh newspapers,
 and checks how many people buy each candy daily -- then hands the shop a fresh
 list, and explains WHY it picked each one. Bad handwriting from the librarian?
-Last week's list stays up. No empty shelves ever.
+Last week's list stays up. No empty shelves ever. And the shop notices the new
+list within a minute -- no waiting for the shopkeeper to wake up.
 
 And the toy box got smarter twice: it now has a shelf space for every candy
 in the catalog, and when a toy has sat untouched for a whole week, the robot

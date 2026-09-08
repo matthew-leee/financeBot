@@ -521,8 +521,19 @@ headlines/data). KEEP holds the position today and is re-consulted daily
 while still stale; DISCARD releases it via the standard exit path
 (`[stale-exit]`). Verdicts are cached once per symbol per day
 (`models/strategist_verdicts.json`); any LLM failure defaults to KEEP.
-Targets only -- hedges remain governed by pair lifecycle + own signals.
-Slots: `FINANCEBOT_SLOTS_FOLLOW_UNIVERSE=true` sizes the book to the pool.
+Eligibility covers **every held non-hedge position** -- including names
+dropped from the pool by weekly churn, which would otherwise rot as
+exit-only orphans. Hedges (pair keys) remain governed by pair lifecycle +
+own signals. Slots: `FINANCEBOT_SLOTS_FOLLOW_UNIVERSE=true` sizes the book
+to the pool.
+
+### Mid-run universe refresh
+
+The active-universe file is fingerprinted (mtime+size) once per pass. On
+change, targets + slots re-resolve BETWEEN passes and the added/removed diff
+is logged (`[universe] REFRESHED`). Sunday curation therefore self-applies
+within one loop pass -- no restarts. Fail-conservative: an unreadable file
+keeps the previous targets and is not retried until its content changes.
 
 Exact formulas:
 

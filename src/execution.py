@@ -568,6 +568,9 @@ def _hardened_buy(broker, ticker, price, pass_ctx) -> None:
         pass_ctx.ledger.reserve_buy(ticker, order_notional)
         append_trade(ticker, "buy", price, qty)
         telem.submitted += 1
+        # Ever-target registry: strategist review stays authorized for this
+        # symbol even after weekly pool churn drops it from active targets.
+        _record_target_origin(ticker)
 
 
 def _hardened_pivot(symbol, broker, pass_ctx) -> None:
@@ -649,6 +652,69 @@ def _hardened_sell(broker, symbol, price, pass_ctx) -> None:
         append_trade(symbol, "sell", price, sell_qty)
         pass_ctx.ledger.apply_sell(symbol, sell_qty, price)
         telem.submitted += 1
+
+
+def _universe_file_fingerprint() -> tuple[int, int] | None:
+    """(mtime_ns, size) of the active-universe file; None when absent."""
+    path = os.environ.get("FINANCEBOT_UNIVERSE_FILE") or config.ACTIVE_UNIVERSE_PATH
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _maybe_refresh_universe(
+    policy, active_targets: list[str], active_target_keys: set[str], state: dict
+) -> tuple[object, list[str], set[str], bool]:
+    """
+    Mid-run universe refresh: when active_universe.json changes on disk since
+    the last resolution, re-resolve targets and slots BETWEEN passes. The
+    "resolved once" determinism holds *within* each pass; only the boundary
+    between passes can evolve -- so Sunday curation self-applies within one
+    loop pass, no restart. Fail-conservative: any refresh error keeps the old
+    set (and the fingerprint is consumed so a broken file is not re-litigated
+    every pass).
+    """
+    fp = _universe_file_fingerprint()
+    if fp is None or fp == state.get("fingerprint"):
+        state["fingerprint"] = fp
+        return policy, active_targets, active_target_keys, False
+
+    try:
+        new_targets = resolve_live_universe()
+    except UniverseError as exc:
+        print(f"[universe] refresh FAILED ({exc}); keeping previous targets.")
+        state["fingerprint"] = fp
+        return policy, active_targets, active_target_keys, False
+
+    new_keys = {_norm_key(sym) for sym in new_targets}
+    if config.SLOTS_FOLLOW_UNIVERSE:
+        import dataclasses
+
+        policy = dataclasses.replace(policy, max_open_positions=len(new_targets))
+    old_keys = set(active_target_keys)
+    added = sorted(new_keys - old_keys)
+    removed = sorted(old_keys - new_keys)
+    print(
+        f"[universe] REFRESHED -> {len(new_targets)} targets "
+        f"(slots={policy.max_open_positions}) added={added} removed={removed}"
+    )
+    state["fingerprint"] = fp
+    return policy, new_targets, new_keys, True
+
+
+def _record_target_origin(symbol: str) -> None:
+    """Register a symbol as ever-target on a successful direct buy, so the
+    strategist can review it later even if weekly pool churn drops it."""
+    try:
+        pairs, stamps, origins = _load_hedge_pairs()
+        key = str(symbol).upper()
+        if key not in origins:
+            origins.add(key)
+            _save_hedge_pairs(pairs, stamps, origins)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[pairs] origin registration failed for {symbol}: {exc}")
 
 
 def _has_pending_exit(snapshot, symbol: str) -> bool:
@@ -1001,9 +1067,15 @@ def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
             _clear_hedge_pair(str(symbol).upper())
             return
 
-    # --- STALE-CONVICTION EXIT (held target; on-call strategist) -----------
+    # --- STALE-CONVICTION EXIT (any held non-hedge position) ---------------
+    # Covers active targets AND pool-dropped ex-targets: when weekly curation
+    # removes a held name, it becomes exit-only -- exactly the position that
+    # needs a strategist verdict instead of rotting. Hedges are excluded:
+    # they are governed by pair lifecycle + own signals.
+    key_upper = str(symbol).upper()
+    is_hedge = key_upper in pairs
     if (
-        is_target
+        not is_hedge
         and pass_ctx.ledger.is_long(symbol)
         and _stale_exit_check(
             symbol, model=model, prob_up=prob_up, pass_ctx=pass_ctx,
@@ -1125,8 +1197,15 @@ def run() -> None:
     model = load_model()
     broker = Broker()
 
+    uni_state: dict = {"fingerprint": _universe_file_fingerprint()}
+
     while True:
         pass_start = time.time()
+
+        # Mid-run universe refresh (Sunday curation self-applies, no restart).
+        policy, active_targets, active_target_keys, _refreshed = _maybe_refresh_universe(
+            policy, active_targets, active_target_keys, uni_state
+        )
 
         # Fetch ONCE per pass: market clock, trusted broker snapshot, sentiment.
         market_open = broker.get_equity_market_open()

@@ -89,6 +89,14 @@ releases start being cut. Until then each entry maps to a push to `master`.
   is closed instead of queueing stale-price fills.
 
 ### Fixed
+- **Sunday curation was silently ignored by the live loop**: the universe
+  resolved exactly once at startup, so the weekly pool sat on disk while the
+  bot kept trading the previous week's targets. Mid-run refresh now checks
+  the active-universe file once per pass and re-resolves targets + slots
+  BETWEEN passes on change (diff logged; fail-conservative on refresh
+  errors). Orphan positions dropped by pool churn are now strategist-
+  reviewable (stale-exit covers every held non-hedge, not just active
+  targets); target buys register ever-target origins for the audit trail.
 - systemd unit: `StartLimitIntervalSec`/`StartLimitBurst` moved to `[Unit]`
   (rate limiter was silently inert); `PYTHONUNBUFFERED=1` so journald receives
   loop telemetry live.
