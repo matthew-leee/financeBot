@@ -177,6 +177,13 @@ STALE_EXIT_DEADZONE_LOW: float = float(os.environ.get("FINANCEBOT_STALE_EXIT_LOW
 STALE_EXIT_DEADZONE_HIGH: float = float(os.environ.get("FINANCEBOT_STALE_EXIT_HIGH", "0.55"))
 STRATEGIST_VERDICTS_PATH: str = "models/strategist_verdicts.json"
 
+# Re-entry negotiation: when a symbol carries a same-day strategist DISCARD,
+# a direct BUY triggers ONE real-time negotiation (fresh research -> allow /
+# uphold) instead of a blunt 24h buy-block. Failure defaults to uphold.
+STRATEGIST_REENTRY_NEGOTIATION: bool = _env_flag(
+    "FINANCEBOT_STRATEGIST_REENTRY_NEGOTIATION", True
+)
+
 # Slots = active universe size: when true, the resolved policy's
 # max_open_positions is replaced by the startup universe count (bounded by
 # the 50 hard cap). The book can then express the whole curated pool.

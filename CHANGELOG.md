@@ -7,6 +7,12 @@ releases start being cut. Until then each entry maps to a push to `master`.
 ## [Unreleased]
 
 ### Added
+- Re-entry negotiation: a same-day strategist DISCARD no longer means the
+  short-horizon model is deaf for 24h. A direct BUY against a morning
+  DISCARD triggers ONE real-time strategist re-examination (fresh research
+  file + the morning verdict + model confidence) ruling ALLOW or UPHELD
+  (cached for the day; failure defaults to uphold). The verdict's
+  `confidence` field is now captured instead of discarded.
 - Stale-conviction exit with on-call long-horizon strategist: held targets
   aged >= `FINANCEBOT_STALE_EXIT_DAYS` (7) with dead conviction
   (`FINANCEBOT_STALE_EXIT_LOW/HIGH` band, default 0.45-0.55) trigger a deep

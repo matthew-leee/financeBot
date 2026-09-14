@@ -816,45 +816,30 @@ def _position_age_days(symbol: str, *, now: datetime | None = None) -> float | N
     return (now - last_buy).total_seconds() / 86400.0
 
 
-def _strategist_consult(
+def _build_research_file(
     symbol: str,
     *,
     held_days: float,
     prob_up: float,
     sentiment_report: dict,
-    transport=None,
+    now: datetime,
     http_get=None,
     fetcher=None,
     macro_connector=None,
-    now: datetime | None = None,
-    verdicts_path: str | None = None,
-) -> tuple[str, str]:
+) -> dict:
     """
-    Deep-research verdict for one purge-eligible position: (decision, reason).
-
-    decision ∈ {"keep", "discard"}; any failure defaults to "keep".
-    Cached once per symbol per calendar day.
+    Deep-research file for strategist consults and re-entry negotiations:
+    long-horizon quant stats (400d bars), FRED macro regime, and a 30-day
+    dated news trajectory. Every layer degrades independently to {}.
     """
-    from datetime import timezone as _tz
-
-    now = now or datetime.now(_tz.utc)
     today = now.date().isoformat()
     key = str(symbol).upper()
 
-    verdicts = _load_verdicts(verdicts_path)
-    cached = verdicts.get(key)
-    if cached and str(cached.get("date")) == today:
-        return str(cached.get("decision", "keep")), str(cached.get("reason", "cached"))
-
-    # --- research file ------------------------------------------------------
     long_stats: dict = {}
     try:
         fetch = fetcher or __import__("src.data", fromlist=["fetch_bars"]).fetch_bars
         bars = fetch(symbol, lookback_days=400)
         if bars is not None and not getattr(bars, "empty", True):
-            import numpy as _np
-            import pandas as _pd
-
             close = bars["close"].astype("float64")
             for name, span in (("ret_20d", 20), ("ret_60d", 60), ("ret_126d", 126), ("ret_252d", 252)):
                 if len(close) > span:
@@ -903,7 +888,7 @@ def _strategist_consult(
     except Exception as exc:  # noqa: BLE001
         macro = {"note": f"macro unavailable: {exc}"}
 
-    research = {
+    return {
         "as_of": today,
         "position": {
             "symbol": key,
@@ -918,6 +903,48 @@ def _strategist_consult(
             for it in news_items
         ],
     }
+
+
+def _strategist_consult(
+    symbol: str,
+    *,
+    held_days: float,
+    prob_up: float,
+    sentiment_report: dict,
+    transport=None,
+    http_get=None,
+    fetcher=None,
+    macro_connector=None,
+    now: datetime | None = None,
+    verdicts_path: str | None = None,
+) -> tuple[str, str]:
+    """
+    Deep-research verdict for one purge-eligible position: (decision, reason).
+
+    decision ∈ {"keep", "discard"}; any failure defaults to "keep".
+    Cached once per symbol per calendar day (with model confidence).
+    """
+    from datetime import timezone as _tz
+
+    now = now or datetime.now(_tz.utc)
+    today = now.date().isoformat()
+    key = str(symbol).upper()
+
+    verdicts = _load_verdicts(verdicts_path)
+    cached = verdicts.get(key)
+    if cached and str(cached.get("date")) == today:
+        return str(cached.get("decision", "keep")), str(cached.get("reason", "cached"))
+
+    research = _build_research_file(
+        symbol,
+        held_days=held_days,
+        prob_up=prob_up,
+        sentiment_report=sentiment_report,
+        now=now,
+        http_get=http_get,
+        fetcher=fetcher,
+        macro_connector=macro_connector,
+    )
 
     system = (
         "You are the long-horizon strategist for a micro-size systematic "
@@ -948,8 +975,117 @@ def _strategist_consult(
     if decision not in ("keep", "discard"):
         decision = "keep"
     reason = str(out.get("reason", ""))[:200]
-    _cache_verdict(verdicts, key, today, decision, reason, verdicts_path)
+    try:
+        confidence = float(out.get("confidence"))
+        if not (confidence == confidence and abs(confidence) != float("inf")):
+            confidence = None
+    except (TypeError, ValueError):
+        confidence = None
+    _cache_verdict(verdicts, key, today, decision, reason, verdicts_path, confidence)
     return decision, reason
+
+
+def _strategist_negotiate_reentry(
+    symbol: str,
+    *,
+    discard_verdict: dict,
+    prob_up: float,
+    sentiment_report: dict,
+    transport=None,
+    now: datetime | None = None,
+) -> tuple[str, str]:
+    """
+    Real-time strategist negotiation: the model wants to re-enter a symbol
+    the strategist DISCARDED earlier today. The strategist re-researches with
+    fresh data and rules ALLOW (short-horizon evidence wins) or UPHELD
+    (long-term concerns stand; entry blocked). Failure defaults to uphold.
+    """
+    from datetime import timezone as _tz
+
+    now = now or datetime.now(_tz.utc)
+    research = _build_research_file(
+        symbol, held_days=0.0, prob_up=prob_up,
+        sentiment_report=sentiment_report, now=now,
+    )
+    research["negotiation"] = {
+        "morning_verdict": {
+            "decision": discard_verdict.get("decision"),
+            "confidence": discard_verdict.get("confidence"),
+            "reason": discard_verdict.get("reason", ""),
+        },
+        "current_model_signal": {"prob_up": round(float(prob_up), 3)},
+ "model_disagreement": "the model fired a BUY against your morning DISCARD; judge on fresh evidence only",
+    }
+
+    system = (
+        "You are the long-horizon strategist for a micro-size systematic "
+        "trader. Earlier TODAY you ruled DISCARD on this symbol (verdict "
+        "included below). Since then, the short-horizon model has fired a BUY "
+        "signal and wants to re-enter. Re-examine the fresh research file "
+        "(news trajectory, macro, long-horizon stats): does new evidence "
+        "genuinely weaken your morning concerns, or do they stand? Be "
+        "conservative: only allow when the morning concerns are credibly "
+        "addressed. Respond STRICT JSON only: "
+        '{"decision": "allow"|"uphold", "confidence": <0-1>, "reason": '
+        '"<=25 words"}.'
+    )
+    user = json.dumps(research)
+
+    try:
+        from curate_universe import _gemini_select
+
+        out = _gemini_select(system, user, transport=transport)
+    except Exception as exc:  # noqa: BLE001 -- fail-closed toward upholding
+        print(f"[strategist] re-entry negotiation failed for {symbol}: {exc}")
+        return "uphold", "strategist unavailable"
+
+    decision = str(out.get("decision", "uphold")).strip().lower()
+    if decision not in ("allow", "uphold"):
+        decision = "uphold"
+    reason = str(out.get("reason", ""))[:200]
+    return decision, reason
+
+
+def _reentry_negotiation_ok(
+    symbol: str, *, prob_up: float, pass_ctx, now: datetime
+) -> bool:
+    """
+    True when a direct BUY may proceed. When a same-day DISCARD verdict exists
+    for the symbol, ONE negotiation decides for the rest of the day:
+    allow -> entry proceeds; uphold -> entries blocked until tomorrow.
+    No same-day discard (or feature off) -> True.
+    """
+    if not getattr(config, "STRATEGIST_REENTRY_NEGOTIATION", True):
+        return True
+    key = str(symbol).upper()
+    today = now.date().isoformat()
+
+    verdicts = _load_verdicts()
+    v = verdicts.get(key)
+    if not v or str(v.get("date")) != today or str(v.get("decision")) != "discard":
+        return True
+
+    re_entry = v.get("reentry") or {}
+    if re_entry.get("date") == today and re_entry.get("decision") in ("allow", "uphold"):
+        if re_entry["decision"] == "allow":
+            return True
+        print(f"[strategist] {key}: re-entry blocked (morning DISCARD upheld, cached).")
+        return False
+
+    decision, reason = _strategist_negotiate_reentry(
+        symbol, discard_verdict=v, prob_up=prob_up,
+        sentiment_report=pass_ctx.sentiment, now=now,
+    )
+    verdicts = _load_verdicts()
+    entry = verdicts.setdefault(key, {})
+    entry["reentry"] = {"date": today, "decision": decision, "reason": reason}
+    _save_verdicts(verdicts)
+
+    if decision == "allow":
+        print(f"[strategist] {key}: re-entry ALLOWED ({reason}).")
+        return True
+    print(f"[strategist] {key}: re-entry UPHELD -- entry blocked ({reason}).")
+    return False
 
 
 def _sentiment_score(report: dict, symbol: str) -> float | None:
@@ -960,9 +1096,12 @@ def _sentiment_score(report: dict, symbol: str) -> float | None:
 
 def _cache_verdict(
     verdicts: dict[str, dict], key: str, today: str, decision: str, reason: str,
-    path: str | None = None,
+    path: str | None = None, confidence: float | None = None,
 ) -> None:
-    verdicts[key] = {"date": today, "decision": decision, "reason": reason}
+    entry = {"date": today, "decision": decision, "reason": reason}
+    if confidence is not None:
+        entry["confidence"] = round(float(confidence), 2)
+    verdicts[key] = entry
     _save_verdicts(verdicts, path)
     print(f"[strategist] {key}: {decision.upper()} ({reason})")
 
@@ -1116,6 +1255,12 @@ def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
             return
 
         if is_trade_allowed(pass_ctx.sentiment, symbol):
+            # Same-day DISCARD negotiation: a morning strategist discard does
+            # not silence the rabbit for 24h -- but re-entry needs the
+            # strategist to re-examine fresh evidence (once per day).
+            if not _reentry_negotiation_ok(symbol, prob_up=prob_up, pass_ctx=pass_ctx, now=pass_ctx.now):
+                telem.skip("strategist_reentry_blocked")
+                return
             _hardened_buy(broker, symbol, price, pass_ctx)
         else:
             print(f"[loop] {symbol}: sentiment weak, engaging Active Pivot.")

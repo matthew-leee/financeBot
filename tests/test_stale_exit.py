@@ -377,3 +377,121 @@ def test_target_buy_registers_origin(tmp_path, monkeypatch):
     assert len(broker.orders) == 1
     _, _, origins = execution._load_hedge_pairs(str(tmp_path / "h.json"))
     assert "AAPL" in origins
+
+
+# --- re-entry negotiation (same-day DISCARD vs fresh model buy) -------------
+
+
+def _seed_discard(path, symbol="AAPL", *, confidence=0.8, reentry=None):
+    today = NOW.date().isoformat()
+    execution._load_verdicts(path)
+    import os as _os
+
+    entry = {"date": today, "decision": "discard", "reason": "morning concerns", "confidence": confidence}
+    if reentry:
+        entry["reentry"] = {"date": today, **reentry}
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({symbol: entry}, fh)
+    return str(path)
+
+
+def test_reentry_allowed_after_negotiation(tmp_path, monkeypatch):
+    path = _seed_discard(tmp_path / "v.json")
+    monkeypatch.setattr(config, "STRATEGIST_VERDICTS_PATH", path)
+    monkeypatch.setattr(config, "TRADES_LOG_PATH", _seed_trades_log(tmp_path, days_ago=10))
+    monkeypatch.setattr(execution, "fetch_bars", lambda sym, lookback_days: _bars(100, 100.0))
+
+    calls: list[dict] = []
+
+    def transport(url, *, headers, body):
+        calls.append(body)
+        return {"choices": [{"message": {"content": json.dumps(
+            {"decision": "allow", "confidence": 0.7, "reason": "concerns addressed"}
+        )}}]}
+
+    monkeypatch.setattr(execution, "_strategist_negotiate_reentry", lambda sym, **kw: (kw, None) if False else _neg_allow(sym, **kw))
+
+    def _neg_allow(symbol, **kw):
+        calls.append(kw.get("discard_verdict", {}))
+        return "allow", "concerns addressed"
+
+    monkeypatch.setattr(execution, "_strategist_negotiate_reentry", _neg_allow)
+    broker = Broker()
+    ctx = _ctx(sentiment={"AAPL": {"score": 8.0}}, active=("AAPL",), positions=[])
+
+    execution.process_symbol_hardened("AAPL", Model(0.99), broker, ctx)
+
+    assert len(broker.orders) == 1  # allowed through
+    assert any("morning concerns" in str(c.get("reason", "")) for c in calls if isinstance(c, dict))
+    v = execution._load_verdicts(path)
+    assert v["AAPL"]["reentry"]["decision"] == "allow"
+
+
+def test_reentry_upheld_blocks_entry(tmp_path, monkeypatch):
+    path = _seed_discard(str(tmp_path / "v.json"))
+    monkeypatch.setattr(config, "STRATEGIST_VERDICTS_PATH", path)
+    monkeypatch.setattr(config, "TRADES_LOG_PATH", _seed_trades_log(tmp_path, days_ago=10))
+    monkeypatch.setattr(execution, "fetch_bars", lambda sym, lookback_days: _bars(100, 100.0))
+    monkeypatch.setattr(
+        execution, "_strategist_negotiate_reentry", lambda sym, **kw: ("uphold", "thesis still broken")
+    )
+    broker = Broker()
+    ctx = _ctx(sentiment={"AAPL": {"score": 8.0}}, active=("AAPL",), positions=[])
+
+    execution.process_symbol_hardened("AAPL", Model(0.99), broker, ctx)
+
+    assert broker.orders == []
+    assert ctx.telemetry.skipped.get("strategist_reentry_blocked") == 1
+    v = execution._load_verdicts(path)
+    assert v["AAPL"]["reentry"]["decision"] == "uphold"
+
+
+def test_negotiation_once_per_day(tmp_path, monkeypatch):
+    path = _seed_discard(
+        str(tmp_path / "v.json"),
+        reentry={"decision": "uphold", "reason": "stands"},
+    )
+    monkeypatch.setattr(config, "STRATEGIST_VERDICTS_PATH", path)
+    monkeypatch.setattr(config, "TRADES_LOG_PATH", _seed_trades_log(tmp_path, days_ago=10))
+    monkeypatch.setattr(execution, "fetch_bars", lambda sym, lookback_days: _bars(100, 100.0))
+    monkeypatch.setattr(
+        execution, "_strategist_negotiate_reentry", lambda sym, **kw: (_ for _ in ()).throw(AssertionError("must use cache"))
+    )
+    broker = Broker()
+    ctx = _ctx(sentiment={"AAPL": {"score": 8.0}}, active=("AAPL",), positions=[])
+
+    execution.process_symbol_hardened("AAPL", Model(0.99), broker, ctx)
+    assert broker.orders == []  # cached uphold blocks without LLM call
+
+
+def test_negotiation_failure_defaults_to_uphold(tmp_path, monkeypatch):
+    path = _seed_discard(str(tmp_path / "v.json"))
+    monkeypatch.setattr(config, "STRATEGIST_VERDICTS_PATH", path)
+    monkeypatch.setattr(config, "TRADES_LOG_PATH", _seed_trades_log(tmp_path, days_ago=10))
+    monkeypatch.setattr(execution, "fetch_bars", lambda sym, lookback_days: _bars(100, 100.0))
+    monkeypatch.setattr(
+        execution, "_strategist_negotiate_reentry", lambda sym, **kw: ("uphold", "strategist unavailable")
+    )
+    broker = Broker()
+    ctx = _ctx(sentiment={"AAPL": {"score": 8.0}}, active=("AAPL",), positions=[])
+
+    execution.process_symbol_hardened("AAPL", Model(0.99), broker, ctx)
+
+    assert broker.orders == []
+    v = execution._load_verdicts(path)
+    assert v["AAPL"]["reentry"]["decision"] == "uphold"
+
+
+def test_no_discard_no_negotiation(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "STRATEGIST_VERDICTS_PATH", str(tmp_path / "v.json"))
+    monkeypatch.setattr(config, "TRADES_LOG_PATH", _seed_trades_log(tmp_path, days_ago=10))
+    monkeypatch.setattr(execution, "fetch_bars", lambda sym, lookback_days: _bars(100, 100.0))
+    monkeypatch.setattr(
+        execution, "_strategist_negotiate_reentry", lambda sym, **kw: (_ for _ in ()).throw(AssertionError("no same-day discard -> must not negotiate"))
+    )
+    broker = Broker()
+    ctx = _ctx(sentiment={"AAPL": {"score": 8.0}}, active=("AAPL",), positions=[])
+
+    execution.process_symbol_hardened("AAPL", Model(0.99), broker, ctx)
+
+    assert len(broker.orders) == 1  # normal buy, no negotiation involved

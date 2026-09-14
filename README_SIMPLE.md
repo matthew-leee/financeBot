@@ -30,6 +30,11 @@ list, and explains WHY it picked each one. Bad handwriting from the librarian?
 Last week's list stays up. No empty shelves ever. And the shop notices the new
 list within a minute -- no waiting for the shopkeeper to wake up.
 
+And when the robot tosses a toy in the morning but the toy looks exciting
+again after lunch, it does not sneak it back -- it politely asks the
+librarian: "are you still sure?" Sometimes the librarian says "fine, take
+it," sometimes "I said no." Either way, nobody sneaks.
+
 And the toy box got smarter twice: it now has a shelf space for every candy
 in the catalog, and when a toy has sat untouched for a whole week, the robot
 does not just toss it -- it asks the wise librarian, who reads a month of

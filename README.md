@@ -521,11 +521,24 @@ headlines/data). KEEP holds the position today and is re-consulted daily
 while still stale; DISCARD releases it via the standard exit path
 (`[stale-exit]`). Verdicts are cached once per symbol per day
 (`models/strategist_verdicts.json`); any LLM failure defaults to KEEP.
-Eligibility covers **every held non-hedge position** -- including names
-dropped from the pool by weekly churn, which would otherwise rot as
-exit-only orphans. Hedges (pair keys) remain governed by pair lifecycle +
-own signals. Slots: `FINANCEBOT_SLOTS_FOLLOW_UNIVERSE=true` sizes the book
-to the pool.
+The strategist rules **KEEP or DISCARD** (strict JSON, must cite specific
+headlines/data). KEEP holds the position today and is re-consulted daily
+while still stale; DISCARD releases it via the standard exit path
+(`[stale-exit]`). Verdicts are cached once per symbol per day
+(`models/strategist_verdicts.json`, including model `confidence`); any LLM
+failure defaults to KEEP. Eligibility covers **every held non-hedge
+position** -- including names dropped from the pool by weekly churn, which
+would otherwise rot as exit-only orphans. Hedges (pair keys) remain
+governed by pair lifecycle + own signals. Slots:
+`FINANCEBOT_SLOTS_FOLLOW_UNIVERSE=true` sizes the book to the pool.
+
+**Re-entry negotiation** (`STRATEGIST_REENTRY_NEGOTIATION`, default on): a
+same-day DISCARD does not bluntly block the short-horizon model for 24h.
+When the model re-fires a buy on a discarded symbol, the strategist
+re-examines with fresh research and rules ALLOW or UPHELD -- once per
+symbol per day, cached, failure defaults to uphold. Long-horizon concerns
+are respected without deafening the fast brain; the disagreement rate is
+observable in the verdict cache and journal.
 
 ### Mid-run universe refresh
 
