@@ -177,6 +177,26 @@ STALE_EXIT_DEADZONE_LOW: float = float(os.environ.get("FINANCEBOT_STALE_EXIT_LOW
 STALE_EXIT_DEADZONE_HIGH: float = float(os.environ.get("FINANCEBOT_STALE_EXIT_HIGH", "0.55"))
 STRATEGIST_VERDICTS_PATH: str = "models/strategist_verdicts.json"
 
+# --- The Gardener: continuous position sizing -------------------------------
+# MODE: "conviction_vol" = every order/holding sized by conviction (P up),
+# mood card, and inverse realized volatility. "flat" = legacy fixed cap.
+SIZING_MODE: str = _env_choice("FINANCEBOT_SIZING_MODE", "conviction_vol", ("conviction_vol", "flat"))
+SIZE_REF_VOL_ANNUAL: float = 0.20          # vol at which invvol multiplier = 1.0
+SIZE_VOL_MULT_LOW: float = 0.33            # jumpy-toy clamp (small piece)
+SIZE_VOL_MULT_HIGH: float = 3.00           # calm-toy clamp (full piece)
+SIZE_MIN_FRACTION: float = 0.15            # floor: never below 15% of cap
+SIZE_CONVICTION_P_LOW: float = 0.58        # P at which conviction mult starts
+SIZE_CONVICTION_P_HIGH: float = 0.70       # P at which conviction mult maxes
+SIZE_SENTIMENT_FLOOR: float = 0.80         # mood 5 -> 0.80, 10 -> 1.00
+SIZE_SENTIMENT_MISSING: float = 0.90       # no card entry -> mild neutral
+SIZE_HEDGE_CONVICTION: float = 0.75        # pivot buys carry no own P
+# Re-evaluation mechanics (the quarter rule + hand-off rule):
+RESIZE_BAND: float = 0.25                  # act only when off by >25% of target
+RESIZE_COOLDOWN_SECONDS: float = float(os.environ.get("FINANCEBOT_RESIZE_COOLDOWN_SECONDS", "3600"))
+RESIZE_MIN_NOTIONAL: float = 50.0          # never trade dust
+RESIZE_STATE_PATH: str = "models/resize_state.json"
+SIZING_LOG_PATH: str = "models/sizing_log.csv"
+
 # Re-entry negotiation: when a symbol carries a same-day strategist DISCARD,
 # a direct BUY triggers ONE real-time negotiation (fresh research -> allow /
 # uphold) instead of a blunt 24h buy-block. Failure defaults to uphold.

@@ -348,12 +348,14 @@ def test_pool_dropped_ex_target_gets_strategist_review(tmp_path, monkeypatch):
     assert broker.orders == [("MSFT", 1.0, "sell")]
 
 
-def test_hedges_are_exempt_from_orphan_review(tmp_path, monkeypatch):
+def test_hedges_get_strategist_review_too(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "SIZING_MODE", "flat")  # isolate from the Gardener
+    # Investment philosophy: hedges are judged on their own merits.
     monkeypatch.setattr(config, "HEDGE_PAIRS_PATH", str(tmp_path / "h.json"))
     monkeypatch.setattr(config, "STRATEGIST_VERDICTS_PATH", str(tmp_path / "v.json"))
     monkeypatch.setattr(config, "TRADES_LOG_PATH", _seed_trades_log(tmp_path, symbol="RWM", days_ago=10))
     monkeypatch.setattr(execution, "fetch_bars", lambda sym, lookback_days: _bars(100, 100.0))
-    monkeypatch.setattr(execution, "_strategist_consult", lambda sym, **kw: (_ for _ in ()).throw(AssertionError("hedge consulted")))
+    monkeypatch.setattr(execution, "_strategist_consult", lambda sym, **kw: ("discard", "own story dead"))
     broker = Broker()
     execution._save_hedge_pairs({"RWM": "BTC/USD"}, {}, set(), str(tmp_path / "h.json"))
     ctx = _ctx(sentiment={}, active=("OTHER",), positions=[_pos("RWM")])
@@ -362,7 +364,7 @@ def test_hedges_are_exempt_from_orphan_review(tmp_path, monkeypatch):
 
     execution.process_symbol_hardened("RWM", Model(0.50), broker, ctx)
 
-    assert broker.orders == []  # hedge lifecycle governs, no strategist consult
+    assert broker.orders == [("RWM", 1.0, "sell")]  # own-merit DISCARD releases the hedge
 
 
 def test_target_buy_registers_origin(tmp_path, monkeypatch):

@@ -7,7 +7,25 @@ releases start being cut. Until then each entry maps to a push to `master`.
 ## [Unreleased]
 
 ### Added
-- Re-entry negotiation: a same-day strategist DISCARD no longer means the
+- **The Gardener (continuous position sizing)**: every order and holding is
+  sized by conviction (P up 0.58→0.60 … 0.70+→1.00), mood card (5→0.80 …
+  10→1.00, missing→0.90), and inverse realized volatility (clamp 0.33–3.0
+  around a 20% reference) — replacing flat per-order allocation. Held
+  positions are re-evaluated every pass: TOP-UP undersized active targets,
+  TRIM oversized ones (hedges included — investments, judged on own merits),
+  crumb-sweep residual dust after deliberate exits. Quarter-rule band (±25%),
+  1h hand-off cooldown, $50 min trade. Never throws away a whole position,
+  never exceeds the cap, degenerate inputs fall back to flat. Full
+  decomposition logged to `models/sizing_log.csv` (the sized-vs-flat stats
+  engine). Env: `FINANCEBOT_SIZING_MODE` (conviction_vol|flat), resize knobs.
+- Pair-rotate now writes a same-day DISCARD verdict (routes model re-entries
+  through re-entry negotiation; blocks same-day Gardener top-ups).
+- Stale-exit/strategist review now covers hedges too (investment philosophy).
+- Test-state isolation: runtime state files are per-test tmp by default.
+
+### Changed
+- Default `SIZING_MODE=conviction_vol`; `flat` restores prior behavior.
+- systemd unit:: a same-day strategist DISCARD no longer means the
   short-horizon model is deaf for 24h. A direct BUY against a morning
   DISCARD triggers ONE real-time strategist re-examination (fresh research
   file + the morning verdict + model confidence) ruling ALLOW or UPHELD

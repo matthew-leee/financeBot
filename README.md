@@ -291,6 +291,30 @@ Install alongside the other schedulers:
     sudo cp deploy/financebot-curate.{service,timer} /etc/systemd/system/
     sudo systemctl daemon-reload && sudo systemctl enable --now financebot-curate.timer
 
+
+### The Gardener (continuous position sizing)
+
+Every order and every holding is sized by merit instead of a flat allocation:
+
+    notional = cap x conviction x mood x inverse-vol   (clamped 15%..100% of cap)
+
+- **conviction**: P(up) 0.58 -> 0.60 ... 0.70+ -> 1.00 (pivot hedges: 0.75)
+- **mood**: card 5 -> 0.80 ... 10 -> 1.00; missing -> 0.90
+- **inverse-vol**: clamp(20% / realized-30d-vol, 0.33, 3.0) — jumpy toys get
+  smaller pieces; calm toys reach the full cap
+
+The Gardener re-evaluates every held position each pass and routes the
+correction: TOP-UP undersized active targets, TRIM oversized ones (hedges
+included — they are investments, judged on own merits), sweep crumbs after
+deliberate exits. Full exits stay with their existing owners (sell signals,
+strategist, rotation). Guards: ±25% rebalance band, 1h per-symbol cooldown,
+$50 minimum trade; never exceeds the cap; degenerate inputs fall back to
+flat. Every decision is logged with its full decomposition to
+`models/sizing_log.csv` — the sized-vs-flat stats engine.
+
+`FINANCEBOT_SIZING_MODE=conviction_vol|flat` (default conviction_vol);
+knobs: `FINANCEBOT_RESIZE_COOLDOWN_SECONDS` etc.
+
 ### Fractionability & market-hours guards
 
 Two execution-path guards close real-money gaps observed in paper soak:
@@ -640,6 +664,8 @@ Legacy engine keeps its `BUY_THRESHOLD` proxy for now.
 | `FINANCEBOT_LLM_BASE_URL` | URL | default OpenRouter (`https://openrouter.ai/api/v1`) |
 | `FINANCEBOT_LLM_MODEL` | str | default `z-ai/glm-5.3-flash` (cheap flash tier, reasoning off) |
 | `FINANCEBOT_LLM_MAX_TOKENS` | int | default 8000 (headroom for 32-symbol JSON) |
+| `FINANCEBOT_SIZING_MODE` | enum | `conviction_vol` (default) or `flat` |
+| `FINANCEBOT_RESIZE_COOLDOWN_SECONDS` | float | per-symbol hand-off rule (default 3600) |
 | `OPENAI_API_KEY` (or custom via `FINANCEBOT_LLM_API_KEY_ENV`) | str | REQUIRED for sentiment + universe curator |
 | `FINANCEBOT_LOOP_INTERVAL_SECONDS` | float | execution loop cadence (default 60; >= 5 validated) |
 | `FINANCEBOT_CURATOR_TARGET_SIZE` | int | weekly pool size (default 32) |

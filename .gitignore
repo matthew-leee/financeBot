@@ -6,6 +6,7 @@ venv/
 
 # Model + state artifacts (regenerate via train.py)
 models/*.json
+models/*.csv
 data/*.csv
 
 # Secrets must NEVER be committed. They live in Windows env vars.

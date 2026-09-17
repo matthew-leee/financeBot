@@ -42,6 +42,17 @@ newspapers about that toy and says "keep, big things are coming" or "toss,
 the story is over." The librarian's answer always wins.
 
 ---
+And the newest hire: the GARDENER. Before, every new toy cost the same
+$5,000 -- bouncy Bitcoin and sleepy Coca-Cola, same money. Now a gardener
+measures every toy every day: "jumpy toys get smaller pieces, calm toys get
+the full allowance, exciting toys get a bit more." The gardener also fixes
+sizes when they drift: tops up the ones that got too small, trims the ones
+that got too big -- but never throws a whole toy away (that's still the
+other bosses' job), and never touches anything for an hour after touching
+it (no fidgeting). Everything it does is written in a special notebook, so
+one day we can check: did careful sizing beat dumb sizing?
+
+---
 
 ## The one-sentence version
 

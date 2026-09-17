@@ -509,7 +509,7 @@ def build_processing_universe(active_targets, snapshot, fifo_inv) -> list[str]:
     return processing
 
 
-def _hardened_buy(broker, ticker, price, pass_ctx) -> None:
+def _hardened_buy(broker, ticker, price, pass_ctx, prob_up: float | None = None) -> None:
     """Guarded buy honoring the trusted snapshot and projected risk gate."""
     snap = pass_ctx.snapshot
     telem = pass_ctx.telemetry
@@ -533,9 +533,23 @@ def _hardened_buy(broker, ticker, price, pass_ctx) -> None:
 
     cap = resolve_position_cap(pass_ctx.policy, pass_ctx.ledger.equity)
 
+    # Gardener sizing: conviction x mood x inverse-vol (falls back to flat cap
+    # on any degenerate input; hard cap never exceeded).
+    bars_for_size = pass_ctx.get_bars(ticker, lookback_days=30)
+    sized = _determine_position_size(
+        ticker, cap=cap, prob_up=prob_up,
+        sentiment_report=pass_ctx.sentiment, bars=bars_for_size,
+    )
+    sized_cap = min(float(cap), float(sized["notional"]))
+    print(
+        f"[size] {ticker}: cap=${cap:.2f} P={prob_up} conv={sized['conviction_mult']} "
+        f"mood={sized['sentiment_mult']} vol={sized['vol']} invvol={sized['invvol_mult']} "
+        f"-> sized=${sized_cap:.2f}"
+    )
+
     # Fractionability pre-check: some inverse ETFs reject fractional quantities
     # outright (Alpaca 40310000). Size in WHOLE shares for those, and skip when
-    # even one share exceeds the cap. Unknown -> legacy fractional sizing.
+    # even one share exceeds the sized budget. Unknown -> legacy fractional sizing.
     frac_fn = getattr(broker, "is_fractionable", None)
     fractionable = None
     if callable(frac_fn):
@@ -545,17 +559,17 @@ def _hardened_buy(broker, ticker, price, pass_ctx) -> None:
             fractionable = None
 
     if fractionable is False:
-        qty = float(int(cap // price)) if price > 0 else 0.0
+        qty = float(int(sized_cap // price)) if price > 0 else 0.0
         if qty < 1:
             telem.skip("non_fractionable_too_expensive")
             print(
                 f"[loop] {ticker}: non-fractionable and 1 share "
-                f"({price:.2f}) exceeds cap ({cap:.2f}); skipping buy."
+                f"({price:.2f}) exceeds sized budget ({sized_cap:.2f}); skipping buy."
             )
             return
         print(f"[loop] {ticker}: non-fractionable -> whole-share sizing ({qty:.0f} sh).")
     else:
-        qty = clamp_position_size(cap, price, max_notional=cap)
+        qty = clamp_position_size(sized_cap, price, max_notional=cap)
 
     order_notional = qty * price
     ok, reason = pass_ctx.ledger.check_buy(ticker, order_notional, price)
@@ -568,6 +582,18 @@ def _hardened_buy(broker, ticker, price, pass_ctx) -> None:
         pass_ctx.ledger.reserve_buy(ticker, order_notional)
         append_trade(ticker, "buy", price, qty)
         telem.submitted += 1
+        # Sizing notebook: decomposition of this order (stats engine).
+        _log_sizing({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "symbol": str(ticker).upper(), "mode": "new_buy",
+            "cap": sized["cap"], "prob": prob_up,
+            "conviction_mult": sized["conviction_mult"],
+            "sentiment_mult": sized["sentiment_mult"], "vol": sized["vol"],
+            "invvol_mult": sized["invvol_mult"],
+            "sized_notional": sized["notional"],
+            "current_notional": 0.0,
+            "taken_notional": round(order_notional, 2),
+        })
         # Ever-target registry: strategist review stays authorized for this
         # symbol even after weekly pool churn drops it from active targets.
         _record_target_origin(ticker)
@@ -905,6 +931,169 @@ def _build_research_file(
     }
 
 
+# ---------------------------------------------------------------------------
+# The Gardener: continuous position sizing
+# ---------------------------------------------------------------------------
+# Every order and every holding is sized by merit, not flat:
+#     notional = cap x conviction_mult x sentiment_mult x invvol_mult
+#     clamped to [SIZE_MIN_FRACTION x cap, cap]
+# Conviction: P(up) 0.58->0.60 ... 0.70+->1.00 (pivot hedges: fixed 0.75)
+# Mood: card 5->0.80 ... 10->1.00, missing->0.90
+# Inverse-vol: clamp(20% / realized 30d vol, 0.33, 3.00)
+# The Gardener re-evaluates held positions every pass: TOP-UP undersized
+# active targets, TRIM oversized ones (hedges included -- they are
+# investments, not insurance), sweep crumbs after deliberate exits.
+# Never throws away a whole position; never exceeds the cap; fail-safe to
+# previous behavior on any degenerate input.
+
+
+def _daily_vol_annualized(bars) -> float | None:
+    """30d annualized vol from a bar frame's close; None when unusable."""
+    try:
+        import pandas as _pd
+
+        if bars is None or getattr(bars, "empty", True):
+            return None
+        close = bars["close"].astype("float64")
+        idx = close.index
+        if isinstance(idx, _pd.DatetimeIndex):
+            idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+            close = close.set_axis(idx)
+            daily = close.resample("1D").last().pct_change().dropna()
+        else:
+            daily = close.pct_change().dropna()
+        if len(daily) < 5:
+            return None
+        vol = float(daily.tail(30).std(ddof=1) * (252 ** 0.5))
+        return vol if (vol == vol and vol > 0) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _determine_position_size(
+    symbol: str,
+    *,
+    cap: float,
+    prob_up: float | None = None,
+    sentiment_report: dict | None = None,
+    bars=None,
+) -> dict:
+    """
+    Compute the sized notional for one order/holding. Pure + deterministic.
+    Returns a decomposition dict; never raises -- any degenerate input falls
+    back toward the flat cap (fail-safe).
+    """
+    mode = str(getattr(config, "SIZING_MODE", "conviction_vol"))
+    result = {
+        "symbol": str(symbol).upper(),
+        "mode": mode,
+        "cap": round(float(cap), 2),
+        "conviction_mult": 1.0,
+        "sentiment_mult": 1.0,
+        "invvol_mult": 1.0,
+        "vol": None,
+        "notional": float(cap),
+    }
+    if mode == "flat" or not (float(cap) > 0):
+        return result
+
+    # Conviction (own P; pivot hedges carry a fixed mid conviction).
+    if prob_up is None:
+        conv = float(getattr(config, "SIZE_HEDGE_CONVICTION", 0.75))
+    else:
+        lo_p = float(getattr(config, "SIZE_CONVICTION_P_LOW", 0.58))
+        hi_p = float(getattr(config, "SIZE_CONVICTION_P_HIGH", 0.70))
+        frac = (float(prob_up) - lo_p) / max(hi_p - lo_p, 1e-9)
+        conv = 0.60 + max(0.0, min(1.0, frac)) * 0.40
+    result["conviction_mult"] = round(conv, 3)
+
+    # Mood factor.
+    score = _sentiment_score(sentiment_report or {}, symbol)
+    if score is None:
+        sent = float(getattr(config, "SIZE_SENTIMENT_MISSING", 0.90))
+    else:
+        floor = float(getattr(config, "SIZE_SENTIMENT_FLOOR", 0.80))
+        sent = floor + max(0.0, min(1.0, (float(score) - 5.0) / 5.0)) * (1.0 - floor)
+    result["sentiment_mult"] = round(sent, 3)
+
+    # Inverse realized vol.
+    vol = _daily_vol_annualized(bars)
+    if vol is None:
+        inv = 1.0
+    else:
+        result["vol"] = round(vol, 4)
+        lo = float(getattr(config, "SIZE_VOL_MULT_LOW", 0.33))
+        hi = float(getattr(config, "SIZE_VOL_MULT_HIGH", 3.0))
+        ref = float(getattr(config, "SIZE_REF_VOL_ANNUAL", 0.20))
+        inv = max(lo, min(hi, ref / vol))
+    result["invvol_mult"] = round(inv, 3)
+
+    notional = float(cap) * conv * sent * inv
+    floor = float(cap) * float(getattr(config, "SIZE_MIN_FRACTION", 0.15))
+    notional = max(floor, min(float(cap), notional))
+    result["notional"] = round(notional, 2)
+    return result
+
+
+def _load_resize_state(path: str | None = None) -> dict:
+    import json
+
+    path = path or config.RESIZE_STATE_PATH
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh) or {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[gardener] unreadable resize state {path}: {exc}")
+    return {"cooldown": {}, "no_action_log": {}}
+
+
+def _save_resize_state(state: dict, path: str | None = None) -> None:
+    import json
+    import tempfile
+
+    path = path or config.RESIZE_STATE_PATH
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"[gardener] failed to persist resize state: {exc}")
+
+
+def _log_sizing(row: dict, path: str | None = None) -> None:
+    """Append one decomposition row to the sizing notebook (stats engine)."""
+    import csv as _csv
+
+    path = path or config.SIZING_LOG_PATH
+    columns = [
+        "ts", "symbol", "mode", "cap", "prob", "conviction_mult",
+        "sentiment_mult", "vol", "invvol_mult", "sized_notional",
+        "current_notional", "taken_notional",
+    ]
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        exists = os.path.exists(path) and os.path.getsize(path) > 0
+        with open(path, "a", newline="", encoding="utf-8") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+            if not exists:
+                writer.writeheader()
+            writer.writerow({c: row.get(c, "") for c in columns})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[gardener] sizing log failed: {exc}")
+
+
 def _strategist_consult(
     symbol: str,
     *,
@@ -1088,6 +1277,213 @@ def _reentry_negotiation_ok(
     return False
 
 
+def _resize_cooldown_ok(key: str, state: dict, now: datetime) -> bool:
+    """Hand-off rule: no second resize of this symbol within the cooldown."""
+    last = (state.get("cooldown") or {}).get(key)
+    if not last:
+        return True
+    try:
+        ts = datetime.fromisoformat(str(last))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (now - ts).total_seconds() >= float(config.RESIZE_COOLDOWN_SECONDS)
+    except (TypeError, ValueError):
+        return True
+
+
+def _resize_mark(key: str, state: dict, now: datetime) -> None:
+    state.setdefault("cooldown", {})[key] = now.isoformat()
+
+
+def _resize_buy(
+    broker, symbol: str, price: float, pass_ctx, notional: float, *, mode: str,
+    is_fractionable: bool | None, state: dict, now: datetime,
+) -> bool:
+    """Gardener top-up: gate-checked buy of `notional` more of a held symbol."""
+    telem = pass_ctx.telemetry
+    if not (pass_ctx.snapshot.positions_ok and pass_ctx.snapshot.open_orders_ok):
+        telem.skip("broker_truth_unknown")
+        return False
+    if not pass_ctx.snapshot.equity_ok:
+        telem.skip("unknown_equity_blocks_buy")
+        return False
+    if not (price > 0):
+        telem.skip("invalid_price")
+        return False
+
+    if is_fractionable is False:
+        qty = float(int(notional // price))
+        if qty < 1:
+            telem.skip("non_fractionable_too_expensive")
+            return False
+    else:
+        qty = math.floor((notional / price) * 1_000_000) / 1_000_000
+    if qty <= 0:
+        telem.skip("zero_qty")
+        return False
+
+    add_notional = qty * price
+    ok, reason = pass_ctx.ledger.check_buy(symbol, add_notional, price)
+    if not ok:
+        telem.skip(reason)
+        print(f"[gardener] {symbol}: top-up rejected by risk gate ({reason}).")
+        return False
+
+    if broker.submit_market_order(symbol, qty, "buy"):
+        pass_ctx.ledger.reserve_buy(symbol, add_notional)
+        append_trade(symbol, "buy", price, qty)
+        telem.submitted += 1
+        _resize_mark(str(symbol).upper(), state, now)
+        print(f"[gardener] {symbol}: TOP-UP {qty} @ {price:.2f} (~${add_notional:.2f}).")
+        return True
+    return False
+
+
+def _resize_sell(
+    broker, symbol: str, price: float, pass_ctx, sell_qty: float, *, mode: str,
+    state: dict, now: datetime,
+) -> bool:
+    """Gardener trim/crumb: gate-respecting partial sell of held quantity."""
+    telem = pass_ctx.telemetry
+    if not pass_ctx.snapshot.positions_ok:
+        telem.skip("positions_unknown_no_sell")
+        return False
+    held = pass_ctx.ledger.held_quantity(symbol)
+    sell_qty = min(float(sell_qty), held)
+    if sell_qty <= 1e-4:
+        return False
+    if broker.submit_market_order(symbol, sell_qty, "sell"):
+        append_trade(symbol, "sell", price, sell_qty)
+        pass_ctx.ledger.apply_sell(symbol, sell_qty, price)
+        telem.submitted += 1
+        _resize_mark(str(symbol).upper(), state, now)
+        print(f"[gardener] {symbol}: TRIM {sell_qty} @ {price:.2f} (mode={mode}).")
+        return True
+    return False
+
+
+def _gardener_resize(
+    symbol: str, *, prob_up: float, price: float, pass_ctx, broker, now: datetime,
+    verdicts_path: str | None = None, state_path: str | None = None,
+    log_path: str | None = None,
+) -> None:
+    """Continuous re-evaluation of ONE held non-hedge position."""
+    telem = pass_ctx.telemetry
+    key = str(symbol).upper()
+    state = _load_resize_state(state_path)
+    if not _resize_cooldown_ok(key, state, now):
+        return
+
+    cap = resolve_position_cap(pass_ctx.policy, pass_ctx.ledger.equity)
+    bars = pass_ctx.get_bars(symbol, lookback_days=30)
+    sized = _determine_position_size(
+        symbol, cap=cap, prob_up=prob_up,
+        sentiment_report=pass_ctx.sentiment, bars=bars,
+    )
+    held = pass_ctx.ledger.held_quantity(symbol)
+    current = abs(held * price) if price > 0 else 0.0
+    target = float(sized["notional"])
+    is_target = key in {str(t).upper() for t in (pass_ctx.active_target_keys or set())}
+
+    verdicts = _load_verdicts(verdicts_path)
+    v = verdicts.get(key) or {}
+    discarded_today = (
+        str(v.get("date")) == now.date().isoformat()
+        and str(v.get("decision")) == "discard"
+    )
+
+    # Crumb sweep: a deliberately exited name left unfilled dust behind.
+    if discarded_today and 0 < current <= float(config.RESIZE_MIN_NOTIONAL):
+        if _resize_sell(broker, symbol, price, pass_ctx, held, mode="crumb_sweep",
+                        state=state, now=now):
+            _log_sizing({
+                "ts": now.isoformat(), "symbol": key, "mode": "crumb_sweep",
+                "cap": sized["cap"], "prob": round(prob_up, 3),
+                "conviction_mult": sized["conviction_mult"],
+                "sentiment_mult": sized["sentiment_mult"], "vol": sized["vol"],
+                "invvol_mult": sized["invvol_mult"],
+                "sized_notional": target, "current_notional": round(current, 2),
+                "taken_notional": round(current, 2),
+            }, log_path)
+            _save_resize_state(state, state_path)
+        return
+
+    band = max(float(config.RESIZE_BAND), 0.0)
+    min_trade = max(float(config.RESIZE_MIN_NOTIONAL), 0.05 * target)
+    delta = target - current
+
+    if abs(delta) < min_trade or abs(delta) / max(target, 1e-9) < band:
+        # Log no_action once per symbol per day (stats without spam).
+        na = state.setdefault("no_action_log", {})
+        if na.get(key) != now.date().isoformat():
+            na[key] = now.date().isoformat()
+            _save_resize_state(state, state_path)
+            _log_sizing({
+                "ts": now.isoformat(), "symbol": key, "mode": "no_action",
+                "cap": sized["cap"], "prob": round(prob_up, 3),
+                "conviction_mult": sized["conviction_mult"],
+                "sentiment_mult": sized["sentiment_mult"], "vol": sized["vol"],
+                "invvol_mult": sized["invvol_mult"],
+                "sized_notional": target, "current_notional": round(current, 2),
+                "taken_notional": 0.0,
+            }, log_path)
+        return
+
+    if delta > 0:
+        # TOP-UP: active pool targets only, never a same-day discarded name.
+        if not is_target:
+            print(f"[gardener] {key}: undersized but not an active target; no top-up.")
+            return
+        if discarded_today:
+            print(f"[gardener] {key}: same-day DISCARD; top-up deferred.")
+            return
+        frac = getattr(broker, "is_fractionable", None)
+        frac_state = None
+        if callable(frac):
+            try:
+                frac_state = frac(symbol)
+            except Exception:  # noqa: BLE001
+                frac_state = None
+        if _resize_buy(broker, symbol, price, pass_ctx, delta, mode="topup",
+                       is_fractionable=frac_state, state=state, now=now):
+            _log_sizing({
+                "ts": now.isoformat(), "symbol": key, "mode": "topup",
+                "cap": sized["cap"], "prob": round(prob_up, 3),
+                "conviction_mult": sized["conviction_mult"],
+                "sentiment_mult": sized["sentiment_mult"], "vol": sized["vol"],
+                "invvol_mult": sized["invvol_mult"],
+                "sized_notional": target, "current_notional": round(current, 2),
+                "taken_notional": round(delta, 2),
+            }, log_path)
+            _save_resize_state(state, state_path)
+    else:
+        # TRIM: any held non-hedge (de-risking toward right-size).
+        excess = current - target
+        frac = getattr(broker, "is_fractionable", None)
+        frac_state = None
+        if callable(frac):
+            try:
+                frac_state = frac(symbol)
+            except Exception:  # noqa: BLE001
+                frac_state = None
+        if frac_state is False:
+            excess = float(int(excess // price)) * price
+        if excess <= 0:
+            return
+        if _resize_sell(broker, symbol, price, pass_ctx, excess / price,
+                        mode="trim", state=state, now=now):
+            _log_sizing({
+                "ts": now.isoformat(), "symbol": key, "mode": "trim",
+                "cap": sized["cap"], "prob": round(prob_up, 3),
+                "conviction_mult": sized["conviction_mult"],
+                "sentiment_mult": sized["sentiment_mult"], "vol": sized["vol"],
+                "invvol_mult": sized["invvol_mult"],
+                "sized_notional": target, "current_notional": round(current, 2),
+                "taken_notional": round(excess, 2),
+            }, log_path)
+            _save_resize_state(state, state_path)
+
+
 def _sentiment_score(report: dict, symbol: str) -> float | None:
     from src.sentiment import get_score
 
@@ -1211,17 +1607,35 @@ def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
     # removes a held name, it becomes exit-only -- exactly the position that
     # needs a strategist verdict instead of rotting. Hedges are excluded:
     # they are governed by pair lifecycle + own signals.
-    key_upper = str(symbol).upper()
-    is_hedge = key_upper in pairs
+    # Hedges included: under the investment philosophy they are judged on
+    # their own merits (own story), alongside pair lifecycle + own signals.
     if (
-        not is_hedge
-        and pass_ctx.ledger.is_long(symbol)
+        pass_ctx.ledger.is_long(symbol)
         and _stale_exit_check(
             symbol, model=model, prob_up=prob_up, pass_ctx=pass_ctx,
             broker=broker, price=price, now=pass_ctx.now,
         )
     ):
         return
+
+    # --- GARDENER: continuous size re-evaluation ---------------------------
+    # Applies to every held non-umbrella... to every HELD position (hedges
+    # included: they are investments, judged on own merits). Skipped when a
+    # full exit is imminent (own sell signal) -- full exits stay with the
+    # existing paths.
+    if (
+        action != "sell"
+        and str(getattr(config, "SIZING_MODE", "conviction_vol")) != "flat"
+        and pass_ctx.ledger.is_long(symbol)
+        and not _has_pending_exit(pass_ctx.snapshot, symbol)
+    ):
+        try:
+            _gardener_resize(
+                symbol, prob_up=prob_up, price=price, pass_ctx=pass_ctx,
+                broker=broker, now=pass_ctx.now,
+            )
+        except Exception as exc:  # noqa: BLE001 -- gardener must never kill pass
+            print(f"[gardener] error on {symbol}: {exc}")
 
     if action == "buy":
         if not is_target:
@@ -1252,6 +1666,16 @@ def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
             _hardened_sell(broker, symbol, price, pass_ctx)
             stamps[str(symbol).upper()] = datetime.now(timezone.utc).date().isoformat()
             _save_hedge_pairs(pairs, stamps, origins)
+            # Same-day DISCARD verdict: blocks same-day top-up via the Gardener
+            # and routes any model re-entry through re-entry negotiation.
+            _v = _load_verdicts()
+            _v[str(symbol).upper()] = {
+                "date": pass_ctx.now.date().isoformat(),
+                "decision": "discard",
+                "confidence": 0.6,
+                "reason": "pair-rotate: model bullish but sentiment explicitly bad",
+            }
+            _save_verdicts(_v)
             return
 
         if is_trade_allowed(pass_ctx.sentiment, symbol):
@@ -1261,7 +1685,7 @@ def process_symbol_hardened(symbol, model, broker, pass_ctx) -> None:
             if not _reentry_negotiation_ok(symbol, prob_up=prob_up, pass_ctx=pass_ctx, now=pass_ctx.now):
                 telem.skip("strategist_reentry_blocked")
                 return
-            _hardened_buy(broker, symbol, price, pass_ctx)
+            _hardened_buy(broker, symbol, price, pass_ctx, prob_up=prob_up)
         else:
             print(f"[loop] {symbol}: sentiment weak, engaging Active Pivot.")
             _hardened_pivot(symbol, broker, pass_ctx)

@@ -148,3 +148,21 @@ def make_fill():
         )
 
     return _make
+
+
+# ===========================================================================
+# State isolation: every test gets fresh runtime-state files by default, so
+# pair-rotate / gardener / strategist verdict writes can never pollute the
+# repo's real state files or leak between tests. Tests that intentionally
+# set their own paths via monkeypatch still override these (last wins).
+# ===========================================================================
+@pytest.fixture(autouse=True)
+def _isolated_runtime_state(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "HEDGE_PAIRS_PATH", str(tmp_path / "hedge_pairs.json"))
+    monkeypatch.setattr(config, "STRATEGIST_VERDICTS_PATH", str(tmp_path / "strategist_verdicts.json"))
+    monkeypatch.setattr(config, "RESIZE_STATE_PATH", str(tmp_path / "resize_state.json"))
+    monkeypatch.setattr(config, "SIZING_LOG_PATH", str(tmp_path / "sizing_log.csv"))
+    # Legacy-semantics tests run flat; the sizing suite opts into conviction_vol.
+    monkeypatch.setattr(config, "SIZING_MODE", "flat")
