@@ -22,6 +22,12 @@ releases start being cut. Until then each entry maps to a push to `master`.
   through re-entry negotiation; blocks same-day Gardener top-ups).
 - Stale-exit/strategist review now covers hedges too (investment philosophy).
 - Test-state isolation: runtime state files are per-test tmp by default.
+- Honest portfolio replay (`src/replay.py`): next-bar execution (a target decided
+  on bar `t` fills at bar `t+1`'s open, so the last decision never trades),
+  explicit `CostModel` commission/slippage, proportional `max_gross_exposure`
+  clamping, stale-price fill skipping, and marked-to-market equity with a real
+  portfolio-return Sharpe via `src.analytics.sharpe_from_returns`. Legacy
+  `backtest.py::simulate` is untouched.
 
 ### Changed
 - Default `SIZING_MODE=conviction_vol`; `flat` restores prior behavior.
@@ -126,6 +132,24 @@ releases start being cut. Until then each entry maps to a push to `master`.
   loop telemetry live.
 - Pending settled-cash commitments: prune no longer deletes the broker-id
   mirror entries needed for fill-driven release (phantom cash reservations).
+- Test state isolation now also redirects `trades_log.csv` and
+  `models/inventory_state.json` to per-test tmp paths, so running the suite
+  can no longer overwrite the live trades ledger or FIFO inventory state.
+- Hedge selection now FAILS CLOSED when no genuinely inverse candidate exists:
+  `select_hedge_asset()` rejects any ETF whose target correlation exceeds
+  `config.HEDGE_MAX_CORR` (default 0.0 = strictly negative) instead of silently
+  buying the least-positively-correlated name. New env knob
+  `FINANCEBOT_HEDGE_MAX_CORR`.
+- `train.py` now validates walk-forward on CALENDAR TIME via the new
+  `src.validation.calendar_walk_forward_validate()` (with label-horizon
+  embargo), instead of splitting the stacked multi-symbol frame by row index.
+
+### Changed
+- Analytics exposes portfolio-level risk metrics: `portfolio_sharpe()` and
+  `sharpe_from_returns()` compute an ANNUALIZED Sharpe from marked equity /
+  periodic returns, with a zero-variance and short-series fail-safe. The
+  existing trade-level `compute_metrics()["sharpe"]` is unchanged and now
+  documented as a trade ratio, not a portfolio Sharpe.
 
 ## [0.1.0] - 2026-08-25
 

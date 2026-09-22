@@ -164,5 +164,7 @@ def _isolated_runtime_state(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "STRATEGIST_VERDICTS_PATH", str(tmp_path / "strategist_verdicts.json"))
     monkeypatch.setattr(config, "RESIZE_STATE_PATH", str(tmp_path / "resize_state.json"))
     monkeypatch.setattr(config, "SIZING_LOG_PATH", str(tmp_path / "sizing_log.csv"))
+    monkeypatch.setattr(config, "TRADES_LOG_PATH", str(tmp_path / "trades_log.csv"))
+    monkeypatch.setattr(config, "INVENTORY_STATE_PATH", str(tmp_path / "inventory_state.json"))
     # Legacy-semantics tests run flat; the sizing suite opts into conviction_vol.
     monkeypatch.setattr(config, "SIZING_MODE", "flat")
