@@ -131,6 +131,50 @@ FINANCEBOT_ALLOW_UNEARNED_PROMOTION=true
   so a restart without `ALLOW_UNEARNED_PROMOTION=true` will **abort at startup**
   (this already happened once — see §6). The override prints a loud banner at
   every boot, by design.
+- **Do not change the risk profile, override, or sizing knobs without an
+  explicit operator decision.** The audit recommendation (roll back to
+  `soak`/`small_live`) is a *pending decision*, not an instruction to act.
+
+---
+
+## 5b. In-flight work — owned by the pi session (inventory 2026-10-25)
+
+The working tree contains a substantial **uncommitted feature batch authored by
+another agent** (pi). HEAD (`f0a5b6d`) is **309/309 tests green**; the failures
+below exist only in this WIP. **The pi session owns finishing it.**
+
+Uncommitted/untracked WIP:
+
+| Area | Files |
+|---|---|
+| Accounting truth layer | `src/accounting.py`, `src/account_sync.py`, `src/account_dashboard.py`, `audit_account.py`, `tests/test_accounting.py`, `tests/test_account_sync.py`, `tests/test_account_dashboard.py` |
+| Replay / research replay | `src/replay.py`, `research_replay.py`, `tests/test_replay.py`, `tests/test_research_replay.py` |
+| Portfolio & hedge research | `tests/test_portfolio_sharpe.py`, `tests/test_hedge_correlation_guard.py` |
+| Validation & data | `src/validation.py`, `tests/test_calendar_validation.py`, `tests/test_data.py` |
+| Loop & risk plumbing | `src/execution.py`, `src/broker.py`, `src/data.py`, `src/macro.py`, `src/portfolio_manager.py`, `src/sentiment.py`, `src/trade_log.py`, `src/analytics.py`, `config.py`, `train.py`, `curate_universe.py`, `generate_sentiment.py`, `dashboard.py`, `backtest.py` |
+| Docs & test hygiene | `README.md`, `README_SIMPLE.md`, `CHANGELOG.md`, `tests/conftest.py`, `tests/test_test_isolation.py`, plus several legacy test files |
+
+**Currently failing (10) — must be green before anything is committed:**
+
+```
+tests/test_calendar_validation.py   ×5
+tests/test_execution_hybrid.py      ×2
+tests/test_macro_connectors.py      ×2
+tests/test_data.py                  ×1
+```
+
+Rules for this WIP:
+
+1. **Finish it first.** Get the suite green, then commit it (with its CHANGELOG +
+   README updates) before starting new work. Do not start parallel features.
+2. **Do not duplicate work.** This batch already builds true-price accounting
+   (retiring the logged-price PnL approximation) and replay tooling — verify
+   against `src/accounting.py` / `src/replay.py` before touching decision-queue
+   items #3, #6, or #7 below; they may already be covered.
+3. **Do not revert or rewrite it** just to get green — fix forward and keep the
+   intended semantics documented in the tests.
+4. `docs`-only commits from the opencode session (`f0a5b6d`, this file) are
+   separate by design; leave them alone.
 
 ---
 
@@ -158,7 +202,9 @@ FINANCEBOT_ALLOW_UNEARNED_PROMOTION=true
    a human clears it, or auto-step-down to `soak` sizing and resume. Today the
    override + restart policy makes it die silently.
 3. **fills-log true-price accounting** — retire the logged-price PnL
-   approximation (dual-engine `PortfolioManager` already records real fills).
+   approximation. **Likely already built in the pi WIP** (`src/accounting.py`,
+   `src/account_sync.py`, `audit_account.py` — see §5b): verify and wire it as
+   the PnL source of truth instead of rebuilding.
 4. **Journald persistence** — `Storage=persistent` + size cap.
 5. **Size rollback** — audit verdict: `growth_live` + override exceeds the
    demonstrated edge. Recommended posture: `soak` ($5) or `small_live` ($1k)
@@ -166,9 +212,11 @@ FINANCEBOT_ALLOW_UNEARNED_PROMOTION=true
 6. **Verdict-quality experiment** (do this before any strategy rewrite):
    compute forward returns of strategist KEEP vs DISCARD symbols from the
    42 cached verdicts. Positive spread ⇒ the LLM layer has signal; zero ⇒ the
-   strategist is noise.
+   strategist is noise. The pi WIP replay tooling (`src/replay.py`,
+   `research_replay.py`) may already supply the harness — check first.
 7. **Sizing-notebook analysis** — 500+ `sizing_log.csv` rows: did
-   conviction/vol sizing beat flat $5k, risk-adjusted?
+   conviction/vol sizing beat flat $5k, risk-adjusted? (May piggyback on the
+   WIP `tests/test_portfolio_sharpe.py` work.)
 8. **PSQH name-collision fix** — designed and live-verified (use the exact
    quoted fund name from Alpaca's asset `name` in the news query; bare tickers
    collide, e.g. PSQ vs PSQ Holdings). Not built yet.
@@ -186,6 +234,9 @@ dead and rebuild the signal (multiagent research engine feeding
 
 ## 8. Operator rules
 
+- **Check §5b before starting anything.** If the tree has another agent's WIP
+  (it does, as of 2026-10-25), finish/commit that first; never build alongside
+  it.
 - **One operator at a time.** Do not let two agent sessions (opencode, pi,
   hermes) mutate the repo or the live box concurrently. Check for
   unexpected `ActiveEnterTimestamp` changes before assuming state.

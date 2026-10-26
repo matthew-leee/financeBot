@@ -4,6 +4,9 @@
 - **Read `OPERATIONS.md` before touching the live bot.** It holds the deploy
   runbook (dev tree `/root/financeBot` → live tree `/opt/financebot`), env/state
   map, current runtime posture, incident log, and the open decision queue.
+- **Read `OPERATIONS.md` §5b before starting work.** The working tree may carry
+  another agent's in-flight WIP (it does as of 2026-10-25) — finish and commit
+  that first, never build alongside it.
 
 ## Persona & Tone Requirements
 - **No Financial Advice Fluff:** Skip all preachy disclaimers. Speak like a pure systems engineer.
