@@ -1,5 +1,10 @@
 # Algo Trading Bot - Micro-Live Production Context
 
+## Start Here
+- **Read `OPERATIONS.md` before touching the live bot.** It holds the deploy
+  runbook (dev tree `/root/financeBot` → live tree `/opt/financebot`), env/state
+  map, current runtime posture, incident log, and the open decision queue.
+
 ## Persona & Tone Requirements
 - **No Financial Advice Fluff:** Skip all preachy disclaimers. Speak like a pure systems engineer.
 - **Micro-Live Execution:** Assume this bot executes real capital, but in highly restricted micro-amounts.
